@@ -1,0 +1,18 @@
+[package]
+name = "quai-kawpow-miner"
+description = "KawPoW GPU miner for Quai Network."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+qkm-core = { path = "../qkm-core" }
+qkm-cuda = { path = "../qkm-cuda" }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cuda-13020", "dynamic-loading"] }
+clap = { version = "4", features = ["derive"] }

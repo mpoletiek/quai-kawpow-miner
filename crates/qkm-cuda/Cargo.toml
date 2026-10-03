@@ -1,0 +1,16 @@
+[package]
+name = "qkm-cuda"
+description = "CUDA backend: NVRTC to native code, GPU DAG generation and the KawPoW search kernel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+qkm-core = { path = "../qkm-core" }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "cuda-13020", "dynamic-loading"] }
