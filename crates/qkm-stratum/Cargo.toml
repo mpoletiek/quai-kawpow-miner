@@ -1,0 +1,16 @@
+[package]
+name = "qkm-stratum"
+description = "Stratum client for KawPoW on Quai nodes (rs-quai and go-quai), with reconnect and failover, plus a mock pool for tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1"
+qkm-core = { path = "../qkm-core" }

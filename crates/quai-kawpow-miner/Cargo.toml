@@ -16,3 +16,9 @@ qkm-core = { path = "../qkm-core" }
 qkm-cuda = { path = "../qkm-cuda" }
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cuda-13020", "dynamic-loading"] }
 clap = { version = "4", features = ["derive"] }
+qkm-stratum = { path = "../qkm-stratum" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+nvml-wrapper = "0.13"
+ctrlc = { version = "3", features = ["termination"] }

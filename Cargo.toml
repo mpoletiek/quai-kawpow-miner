@@ -14,3 +14,8 @@ rsq-pow = { git = "https://github.com/mpoletiek/rs-quai.git", branch = "main" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+# Dependencies (rsq-pow's light cache and hashing) optimized in debug builds
+# and tests: an epoch's light cache takes minutes unoptimized.
+[profile.dev.package."*"]
+opt-level = 3

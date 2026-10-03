@@ -1,10 +1,11 @@
 //! quai-kawpow-miner: KawPoW GPU miner for Quai Network.
 //!
-//! Phase 1 commands: `verify` (GPU against rs-quai's `rsq-pow`), `bench`
-//! (hashrate, with a launch-geometry sweep), `compile` and `kernel`.
+//! Commands: `mine` (stratum mining), `verify` (GPU against rs-quai's
+//! `rsq-pow`), `bench` (hashrate, with a launch-geometry sweep), `compile`
+//! and `kernel`.
 
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use qkm_core::kernel::{DagLoad, SearchParams, search_source};
@@ -30,6 +31,35 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Mine through a Quai node's stratum (rs-quai or go-quai).
+    Mine {
+        /// Pool `host:port` or `stratum+tcp://host:port`; repeat for
+        /// failover, in order of preference.
+        #[arg(long = "pool")]
+        pools: Vec<String>,
+        /// `0xADDRESS.worker` (the payout address and a worker name).
+        #[arg(long)]
+        user: Option<String>,
+        /// Password options, e.g. `d=0.2` (a fixed stratum difficulty).
+        #[arg(long, default_value = "")]
+        pass: String,
+        /// File holding the stratum auth token (sent as `auth=<token>`;
+        /// never logged).
+        #[arg(long)]
+        auth_token_file: Option<std::path::PathBuf>,
+        /// TOML configuration (flags given on the command line win).
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Serve the stats as JSON on this address, e.g. 127.0.0.1:4073.
+        #[arg(long)]
+        api: Option<std::net::SocketAddr>,
+        /// Seconds between status lines.
+        #[arg(long)]
+        status_secs: Option<u64>,
+        /// Never build the next epoch's DAG ahead.
+        #[arg(long)]
+        no_dag_prefetch: bool,
+    },
     /// Compare the GPU's mix digests and final hashes with rsq-pow's, and
     /// check that every solution the search kernel reports verifies.
     Verify {
@@ -369,8 +399,136 @@ fn bench(
     Ok(())
 }
 
+/// The TOML configuration file.
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    device: Option<usize>,
+    api: Option<std::net::SocketAddr>,
+    status_secs: Option<u64>,
+    dag_prefetch: Option<bool>,
+    #[serde(default, rename = "pool")]
+    pools: Vec<FilePool>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilePool {
+    url: String,
+    user: String,
+    #[serde(default)]
+    pass: String,
+    auth_token_file: Option<std::path::PathBuf>,
+}
+
+/// `auth=<token>` from a file, put in front of the other options.
+fn password(pass: &str, token_file: Option<&std::path::Path>) -> Result<String, String> {
+    let Some(f) = token_file else {
+        return Ok(pass.to_string());
+    };
+    let token = std::fs::read_to_string(f)
+        .map_err(|e| format!("cannot read the auth token file {}: {e}", f.display()))?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(format!("the auth token file {} is empty", f.display()));
+    }
+    Ok(if pass.is_empty() {
+        format!("auth={token}")
+    } else {
+        format!("auth={token},{pass}")
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mine(
+    device: usize,
+    pools: Vec<String>,
+    user: Option<String>,
+    pass: String,
+    auth_token_file: Option<std::path::PathBuf>,
+    config: Option<std::path::PathBuf>,
+    api: Option<std::net::SocketAddr>,
+    status_secs: Option<u64>,
+    no_dag_prefetch: bool,
+) -> Result<(), String> {
+    use quai_kawpow_miner::miner::{MinerConfig, run as run_miner};
+    use quai_kawpow_miner::stats::Stats;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let file: FileConfig = match &config {
+        Some(p) => {
+            let text = std::fs::read_to_string(p)
+                .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+            toml::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))?
+        }
+        None => FileConfig::default(),
+    };
+    let pool_list = if pools.is_empty() {
+        file.pools
+            .iter()
+            .map(|p| {
+                Ok(qkm_stratum::Pool {
+                    url: p.url.clone(),
+                    user: p.user.clone(),
+                    pass: password(&p.pass, p.auth_token_file.as_deref())?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        let user = user.ok_or("--user 0xADDRESS.worker is required with --pool")?;
+        let pass = password(&pass, auth_token_file.as_deref())?;
+        pools
+            .iter()
+            .map(|u| qkm_stratum::Pool {
+                url: u.clone(),
+                user: user.clone(),
+                pass: pass.clone(),
+            })
+            .collect()
+    };
+    if pool_list.is_empty() {
+        return Err("no pool: give --pool or a [[pool]] in --config".into());
+    }
+    let mut cfg = MinerConfig::new(pool_list);
+    cfg.device = file.device.unwrap_or(device);
+    cfg.status_every = Duration::from_secs(status_secs.or(file.status_secs).unwrap_or(30).max(1));
+    cfg.dag_prefetch = !no_dag_prefetch && file.dag_prefetch.unwrap_or(true);
+    let stats = Arc::new(Stats::default());
+    if let Some(addr) = api.or(file.api) {
+        let bound = quai_kawpow_miner::api::serve(addr, stats.clone())
+            .map_err(|e| format!("API on {addr}: {e}"))?;
+        println!("API: http://{bound}/");
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let s = stop.clone();
+    ctrlc::set_handler(move || s.store(true, Ordering::SeqCst))
+        .map_err(|e| format!("signal handler: {e}"))?;
+    run_miner(cfg, stop, stats)
+}
+
 fn run(cli: Cli) -> Result<(), String> {
     match cli.cmd {
+        Cmd::Mine {
+            pools,
+            user,
+            pass,
+            auth_token_file,
+            config,
+            api,
+            status_secs,
+            no_dag_prefetch,
+        } => mine(
+            cli.device,
+            pools,
+            user,
+            pass,
+            auth_token_file,
+            config,
+            api,
+            status_secs,
+            no_dag_prefetch,
+        ),
         Cmd::Kernel { height } => {
             let e = Epoch::for_height(height);
             print!(

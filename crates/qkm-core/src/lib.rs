@@ -6,6 +6,6 @@ pub mod epoch;
 pub mod kernel;
 pub mod program;
 
-pub use epoch::{Epoch, Hashes, Verifier, boundary64, meets, period};
+pub use epoch::{EPOCH_LENGTH, Epoch, Hashes, Verifier, boundary64, meets, period};
 pub use program::{Op, Program};
 pub use rsq_pow;
