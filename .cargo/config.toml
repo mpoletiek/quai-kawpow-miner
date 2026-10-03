@@ -1,0 +1,3 @@
+[net]
+# rsq-pow comes from the private rs-quai repository: let cargo use git (and its credentials).
+git-fetch-with-cli = true
