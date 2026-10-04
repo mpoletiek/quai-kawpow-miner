@@ -25,7 +25,7 @@ for that setup:
 - **Observable.** A JSON API, Prometheus metrics and NVML telemetry
   (temperature, power, fan) with limits; several GPUs per host.
 
-Status: phase 1 done (CUDA core); phase 2 (stratum mining) next.
+Status: phase 2 done (stratum mining on mainnet); phase 3 (operations) next.
 
 ## Phase 1 results (RTX 3060 Ti, driver 595.99 / CUDA 13.2, toolkit 13.4)
 
@@ -52,24 +52,105 @@ the DAG loop or dropping the compiler fence doesn't help; launch geometry
 matters little (block 256, grid 256, two streams is the default); a DAG from
 `cuMemAlloc` beats one from the stream-ordered pool.
 
+## Phase 2 results (2026-10-04, mainnet, rs-quai's stratum on the soak node)
+
+- **Live:** 38 minutes on mainnet through rs-quai's stratum (KawPoW
+  port, `d=0.2`, worker `qkm0`).
+  - 78 shares accepted, against 78.7 expected at 30 MH/s.
+  - 0 rejected, stale or lost; 0 disconnects.
+  - 30.0 MH/s on the 10-minute average.
+  - Submit-to-answer latency 10-22 ms (median 17).
+  - The node counted the same 78 valid shares and logged no invalid ones.
+- **Coverage:** over 2^20 nonces at epoch 608, the search kernel reports
+  exactly the nonces whose final hash meets the target (241 of 241, none
+  missing, none extra), per the debug kernel checked against `rsq-pow`. Over
+  2^31 nonces at a 1/2^24 target it found 112 solutions (expected 128 +/- 11).
+- **End to end against the mock pool,** which checks shares as rs-quai does:
+  - 65 shares accepted, 0 rejected;
+  - epoch 0 to 1 with a DAG built ahead and ready at the switch, and again
+    with a rebuild;
+  - a single far-epoch job ignored.
+- **Client:** 6 tests against the mock pool:
+  - the protocol, and CPU-mined shares checked the rs-quai way, including
+    duplicate, mix-mismatch and unknown-job refusals;
+  - reconnect after a drop, and failover to a second pool;
+  - the auth token, required and never echoed;
+  - `set_target` and `set_difficulty`;
+  - an unanswered share timing out.
+
 ## Usage
 
     export LD_LIBRARY_PATH=/opt/cuda/lib64   # libnvrtc
+
+    # Mine through a Quai node's stratum (rs-quai or go-quai, KawPoW port 3333).
+    quai-kawpow-miner mine --pool stratum+tcp://10.0.0.13:3333 \
+        --user 0xYOUR_QUAI_ADDRESS.rig1 --pass d=0.2 \
+        --auth-token-file ~/.config/quai/stratum-token --api 127.0.0.1:4073
+
     quai-kawpow-miner verify                 # GPU vs rsq-pow
     quai-kawpow-miner bench --height 4565235 --seconds 30
     quai-kawpow-miner bench --block 128,256 --grid 256,1824 --streams 2,3   # sweep
 
-Layout: `crates/qkm-core` (program, kernel sources, epochs, CPU
-verification), `crates/qkm-cuda` (cudarc backend), `crates/quai-kawpow-miner`
-(the binary).
+`mine`:
+- `--pool` takes `host:port` or `stratum+tcp://host:port`; repeat it for
+  failover, in order of preference. The miner returns to the first pool
+  after ten minutes on a backup.
+- `--user` is your payout address plus a worker name.
+- `--pass` holds the pool options; `d=0.2` fixes the stratum difficulty (one
+  share about every 30 s at 30 MH/s; without it the node's vardiff starts at
+  50 and takes minutes to come down).
+- `--auth-token-file` reads the stratum token (sent as `auth=<token>`); it is
+  never logged and never appears on the command line.
+- `--api ADDR` serves the stats as JSON (`curl http://127.0.0.1:4073/`).
+- `--config miner.toml` holds the same settings:
+
+      device = 0
+      api = "127.0.0.1:4073"
+      status_secs = 60
+
+      [[pool]]
+      url = "stratum+tcp://10.0.0.13:3333"
+      user = "0xYOUR_QUAI_ADDRESS.rig1"
+      pass = "d=0.2"
+      auth_token_file = "/home/you/.config/quai/stratum-token"
+
+      [[pool]]   # a backup
+      url = "stratum+tcp://10.0.0.12:3333"
+      user = "0xYOUR_QUAI_ADDRESS.rig1"
+      pass = "d=0.2"
+
+How it stays up:
+- **Epochs.** The GPU thread alone owns the DAG, so an epoch change can't
+  race a build. Near the end of an epoch, the next light cache and the next
+  epoch's first kernel are prepared ahead, and the next DAG too when the card
+  holds two. A job from a far epoch (a stale template) is followed only when
+  a second job confirms it.
+- **Shares.** Every GPU solution is checked with `rsq-pow` before it is sent;
+  a mismatch is logged as a GPU bug and never submitted.
+- **Connections.** Reconnect with backoff, failover, and a reconnect when the
+  pool stops answering shares (three in a row) or sends no job for three
+  minutes. CUDA errors are retried and never end the miner.
+
+Layout:
+- `crates/qkm-core`: program, kernel sources, epochs, CPU verification;
+- `crates/qkm-cuda`: the cudarc backend;
+- `crates/qkm-stratum`: the stratum client and a mock pool that checks
+  shares the way rs-quai's server does;
+- `crates/quai-kawpow-miner`: the miner (library) and the binary.
+
+Tests: `cargo test` runs the protocol, client and mock-pool tests on the
+CPU. The GPU end-to-end tests (mining through the mock pool across an epoch
+change) need the GPU to themselves:
+
+    cargo test --release -p quai-kawpow-miner --test gpu_mock -- --ignored --test-threads 1
 
 ## Plan
 
 1. **CUDA core** (done): per-period ProgPoW kernel generation from
    `rsq-pow`, DAG generation on the GPU, the search kernel, a differential
    test against `rsq-pow` at several epochs, and a benchmark.
-2. **Stratum mining:** a Quai stratum client, job handling, CPU check of
-   every share, next-epoch DAG prefetch, failover; tested against rs-quai's
+2. **Stratum mining** (done): a Quai stratum client, job handling, CPU check
+   of every share, next-epoch prefetch, failover; tested against rs-quai's
    stratum on mainnet.
 3. **Operations:** solo mode over RPC/WebSocket, JSON API, Prometheus,
    NVML, several GPUs, configuration file, packaging.

@@ -304,6 +304,111 @@ fn verify(gpu: &Gpu, heights: &[u64], cases: u32, block: u32, seed: u64) -> Resu
             failures += 1;
         }
         failures += sol_bad;
+        // 3) Coverage: the search kernel must report exactly the nonces whose
+        // final hash meets the target, per the debug kernel (checked against
+        // rsq-pow above). Small launches keep under MAX_RESULTS per launch.
+        let mut cov_target = [0xffu8; 32];
+        cov_target[0] = 0x00;
+        cov_target[1] = 0x0f; // 1 in 4096
+        let header3 = rng.bytes32();
+        let start3 = rng.next() & 0x00ff_ffff_ffff_ffff;
+        let n3: u32 = 1 << 20;
+        let all = searcher
+            .hash_all(&k, &dag, Header::from_bytes(&header3), start3, n3)
+            .map_err(|e| e.to_string())?;
+        let want: std::collections::BTreeSet<u64> = all
+            .iter()
+            .take(n3 as usize)
+            .enumerate()
+            .filter(|(_, (_, fin))| {
+                let mut b = [0u8; 32];
+                for (i, w) in fin.iter().enumerate() {
+                    b[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+                }
+                meets(&b, &cov_target)
+            })
+            .map(|(i, _)| start3.wrapping_add(i as u64))
+            .collect();
+        let mut small = Searcher::new(
+            gpu,
+            Geometry {
+                grid: 4,
+                streams: 1,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let (done3, found3) = small
+            .run(
+                &k,
+                &dag,
+                Header::from_bytes(&header3),
+                boundary64(&cov_target),
+                start3,
+                &mut |done, _| done < u64::from(n3),
+            )
+            .map_err(|e| e.to_string())?;
+        let got: std::collections::BTreeSet<u64> = found3
+            .iter()
+            .map(|f| f.nonce)
+            .filter(|n| want.contains(n) || n.wrapping_sub(start3) < u64::from(n3))
+            .collect();
+        let missing = want.difference(&got).count();
+        let extra = got.difference(&want).count();
+        println!(
+            "  coverage: {done3} nonces, {} qualify (debug kernel), search reported {}, {missing} missing, {extra} extra",
+            want.len(),
+            got.len()
+        );
+        failures += (missing + extra) as u64;
+        // 4) Rate at scale: solutions per nonce against the target's odds.
+        let mut rate_target = [0xffu8; 32];
+        rate_target[0] = 0x00;
+        rate_target[1] = 0x00;
+        rate_target[2] = 0x00; // 1 in 2^24
+        let mut big = Searcher::new(
+            gpu,
+            Geometry {
+                grid: 256,
+                streams: 2,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let n4: u64 = 1 << 31;
+        let mut count = 0usize;
+        let mut done4 = 0u64;
+        let mut s4 = rng.next() & 0x00ff_ffff_ffff_ffff;
+        let header4 = rng.bytes32();
+        while done4 < n4 {
+            let (d, f) = big
+                .run(
+                    &k,
+                    &dag,
+                    Header::from_bytes(&header4),
+                    boundary64(&rate_target),
+                    s4,
+                    &mut |done, found| done4 + done < n4 && found.is_empty(),
+                )
+                .map_err(|e| e.to_string())?;
+            for x in &f {
+                let h = verifier.hash(height, &header4, x.nonce);
+                if meets(&h.hash, &rate_target) {
+                    count += 1;
+                }
+            }
+            done4 += d;
+            s4 = s4.wrapping_add(d);
+        }
+        let expect = done4 as f64 / f64::from(1u32 << 24);
+        println!(
+            "  rate: {done4} nonces at 1/2^24: {count} solutions, expected {expect:.0} (+/- {:.0})",
+            expect.sqrt()
+        );
+        if (count as f64 - expect).abs() > 4.0 * expect.sqrt() {
+            println!("  rate: outside 4 sigma: FAIL");
+            failures += 1;
+        }
+        drop(small);
+        drop(big);
         drop(searcher);
         drop(kernels);
         drop(dag);
