@@ -628,6 +628,25 @@ struct FilePool {
     auth_token_file: Option<std::path::PathBuf>,
 }
 
+/// A pool URL in kawpowminer's form, `stratum+tcp://USER[:PASS]@host:port`
+/// (Quai's docs use it), split into the URL without the login, the user and
+/// the password.
+fn split_login(url: &str) -> (String, Option<String>, Option<String>) {
+    let (scheme, rest) = url.split_once("://").map_or(("", url), |(s, r)| (s, r));
+    let Some((login, host)) = rest.rsplit_once('@') else {
+        return (url.to_string(), None, None);
+    };
+    let (user, pass) = login
+        .split_once(':')
+        .map_or((login, None), |(u, p)| (u, Some(p.to_string())));
+    let bare = if scheme.is_empty() {
+        host.to_string()
+    } else {
+        format!("{scheme}://{host}")
+    };
+    (bare, (!user.is_empty()).then(|| user.to_string()), pass)
+}
+
 /// One pool's stratum login, checked: the payout address and worker, and
 /// the password (`auth=<token>` from the token file first, the options,
 /// then `lock=`). Returns the pool and what is worth telling the user.
@@ -714,14 +733,27 @@ fn mine(
     let mut pool_list = Vec::new();
     if pools.is_empty() {
         for p in &file.pools {
-            let (pool, n) = login(&p.url, &p.user, &p.pass, p.auth_token_file.as_deref(), lock)?;
+            let (bare, _, _) = split_login(&p.url);
+            let (pool, n) = login(&bare, &p.user, &p.pass, p.auth_token_file.as_deref(), lock)?;
             pool_list.push(pool);
             notes.extend(n);
         }
     } else {
-        let user = user.ok_or("--user 0xADDRESS.worker is required with --pool")?;
         for u in &pools {
-            let (pool, n) = login(u, &user, &pass, auth_token_file.as_deref(), lock)?;
+            // --user and --pass win over a login in the URL.
+            let (bare, url_user, url_pass) = split_login(u);
+            let user = user.clone().or(url_user.clone()).ok_or(
+                "--user 0xADDRESS.worker is required with --pool (or stratum+tcp://0xADDRESS.worker@host:port)",
+            )?;
+            let pass = if pass.is_empty() {
+                url_pass.clone().unwrap_or_default()
+            } else {
+                pass.clone()
+            };
+            let (pool, mut n) = login(&bare, &user, &pass, auth_token_file.as_deref(), lock)?;
+            if url_user.is_some() && url_user != Some(user.clone()) {
+                n.push(format!("{}: the user in the URL is ignored for --user", pool.host_port()));
+            }
             pool_list.push(pool);
             notes.extend(n);
         }
@@ -1152,5 +1184,32 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logins_in_urls() {
+        assert_eq!(
+            split_login("stratum+tcp://0xab.rig:d=1,lock=2@10.0.0.13:3333"),
+            (
+                "stratum+tcp://10.0.0.13:3333".into(),
+                Some("0xab.rig".into()),
+                Some("d=1,lock=2".into())
+            )
+        );
+        assert_eq!(
+            split_login("0xab.rig@node:3335"),
+            ("node:3335".into(), Some("0xab.rig".into()), None)
+        );
+        assert_eq!(split_login("stratum+tcp://node:3333"), ("stratum+tcp://node:3333".into(), None, None));
+    }
+
+    #[test]
+    fn exit_codes() {
+        assert!(matches!(CliError::from("x"), CliError::Config(_)));
     }
 }

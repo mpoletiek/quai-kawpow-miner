@@ -116,7 +116,9 @@ status line instead.
 
 `mine`:
 - `--pool URL` (`host:port` or `stratum+tcp://host:port`), repeated for
-  failover in order of preference. After ten minutes on a backup the miner
+  failover in order of preference. kawpowminer's form with the login in the
+  URL, `stratum+tcp://0xADDRESS.worker:d=1@host:port` (as in Quai's docs),
+  works too; `--user` and `--pass` win over it. After ten minutes on a backup the miner
   probes the first pool every minute and goes back when it answers.
 - `--user 0xADDRESS.worker` (the worker name: letters, digits, `-`, `_`).
 - `--pass OPTIONS`, `--lock 0..3`, `--auth-token-file FILE`: see above.
