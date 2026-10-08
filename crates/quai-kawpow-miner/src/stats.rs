@@ -1,6 +1,6 @@
 //! Counters shared by the miner's threads, the status line and the API.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -40,11 +40,110 @@ pub struct DeviceReading {
     pub sm_clock_mhz: Option<u32>,
 }
 
+/// Hashes per second over the last `window` of `samples`.
+fn rate(samples: &VecDeque<(Instant, u64)>, window: Duration) -> f64 {
+    let Some(&(t1, h1)) = samples.back() else {
+        return 0.0;
+    };
+    let Some(&(t0, h0)) = samples
+        .iter()
+        .find(|(t, _)| t1.duration_since(*t) <= window)
+        .filter(|(t, _)| *t < t1)
+    else {
+        return 0.0;
+    };
+    (h1 - h0) as f64 / t1.duration_since(t0).as_secs_f64()
+}
+
+/// Appends a sample, keeping ten minutes.
+fn push_sample(samples: &mut VecDeque<(Instant, u64)>, now: Instant, hashes: u64) {
+    samples.push_back((now, hashes));
+    while samples
+        .front()
+        .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(600))
+    {
+        samples.pop_front();
+    }
+}
+
+fn state_name(g: &GpuState) -> String {
+    match g {
+        GpuState::Idle => "idle".to_string(),
+        GpuState::BuildingDag(e) => format!("building DAG {e}"),
+        GpuState::Mining => "mining".to_string(),
+    }
+}
+
+fn state_json(g: &GpuState) -> Value {
+    match g {
+        GpuState::Idle => json!({"state": "idle"}),
+        GpuState::BuildingDag(e) => json!({"state": "building_dag", "epoch": e}),
+        GpuState::Mining => json!({"state": "mining"}),
+    }
+}
+
+/// " 64C 150W fan 33%" (the fields the card reports).
+fn reading_text(r: &DeviceReading) -> String {
+    let mut s = String::new();
+    if let Some(t) = r.temperature_c {
+        s.push_str(&format!(" {t}C"));
+    }
+    if let Some(p) = r.power_w {
+        s.push_str(&format!(" {p:.0}W"));
+    }
+    if let Some(f) = r.fan_pct {
+        s.push_str(&format!(" fan {f}%"));
+    }
+    s
+}
+
+/// One GPU's counters.
+pub struct GpuStats {
+    /// CUDA device index.
+    pub device: usize,
+    /// Nonces hashed since start.
+    pub hashes: AtomicU64,
+    /// Its shares accepted.
+    pub accepted: AtomicU64,
+    /// Its shares not accepted (refused, stale or lost).
+    pub refused: AtomicU64,
+    samples: Mutex<VecDeque<(Instant, u64)>>,
+    state: Mutex<GpuState>,
+    reading: Mutex<(String, DeviceReading)>,
+}
+
+impl GpuStats {
+    fn new(device: usize) -> GpuStats {
+        GpuStats {
+            device,
+            hashes: AtomicU64::new(0),
+            accepted: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+            samples: Mutex::new(VecDeque::new()),
+            state: Mutex::new(GpuState::Idle),
+            reading: Mutex::new((String::new(), DeviceReading::default())),
+        }
+    }
+
+    /// Hashes per second over the last `window`.
+    pub fn hashrate(&self, window: Duration) -> f64 {
+        rate(&lock(&self.samples), window)
+    }
+
+    /// What the GPU is doing.
+    pub fn set_state(&self, g: GpuState) {
+        *lock(&self.state) = g;
+    }
+
+    /// The device name and its latest reading.
+    pub fn set_reading(&self, name: &str, r: DeviceReading) {
+        *lock(&self.reading) = (name.to_string(), r);
+    }
+}
+
 /// Shared counters.
 pub struct Stats {
     started: Instant,
-    /// Nonces hashed since start.
-    pub hashes: AtomicU64,
     /// Shares accepted.
     pub accepted: AtomicU64,
     /// Shares refused (not stale).
@@ -57,69 +156,72 @@ pub struct Stats {
     pub gpu_errors: AtomicU64,
     /// Connected and authorized.
     pub connected: AtomicBool,
+    gpus: Vec<GpuStats>,
     samples: Mutex<VecDeque<(Instant, u64)>>,
+    /// Which GPU found each share in flight (by share sequence number).
+    owners: Mutex<HashMap<u64, usize>>,
     pool: Mutex<String>,
     job: Mutex<Option<(String, u64)>>,
     difficulty: Mutex<f64>,
-    gpu: Mutex<GpuState>,
     last_accept: Mutex<Option<Instant>>,
     last_reject: Mutex<Option<String>>,
-    device: Mutex<(String, DeviceReading)>,
     latency_ms: Mutex<VecDeque<u64>>,
 }
 
 impl Default for Stats {
     fn default() -> Self {
+        Stats::new(&[0])
+    }
+}
+
+impl Stats {
+    /// Counters for the GPUs with these CUDA device indexes.
+    pub fn new(devices: &[usize]) -> Stats {
         Stats {
             started: Instant::now(),
-            hashes: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             stale: AtomicU64::new(0),
             lost: AtomicU64::new(0),
             gpu_errors: AtomicU64::new(0),
             connected: AtomicBool::new(false),
+            gpus: devices.iter().map(|&d| GpuStats::new(d)).collect(),
             samples: Mutex::new(VecDeque::new()),
+            owners: Mutex::new(HashMap::new()),
             pool: Mutex::new(String::new()),
             job: Mutex::new(None),
             difficulty: Mutex::new(0.0),
-            gpu: Mutex::new(GpuState::Idle),
             last_accept: Mutex::new(None),
             last_reject: Mutex::new(None),
-            device: Mutex::new((String::new(), DeviceReading::default())),
             latency_ms: Mutex::new(VecDeque::new()),
         }
     }
-}
 
-impl Stats {
-    /// Records a hashrate sample (call every few seconds).
-    pub fn sample(&self) {
-        let mut s = lock(&self.samples);
-        let now = Instant::now();
-        s.push_back((now, self.hashes.load(Ordering::Relaxed)));
-        while s
-            .front()
-            .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(600))
-        {
-            s.pop_front();
-        }
+    /// The GPUs' counters, in the order given to [`Stats::new`].
+    pub fn gpus(&self) -> &[GpuStats] {
+        &self.gpus
     }
 
-    /// Hashes per second over the last `window`.
-    pub fn hashrate(&self, window: Duration) -> f64 {
-        let s = lock(&self.samples);
-        let Some(&(t1, h1)) = s.back() else {
-            return 0.0;
-        };
-        let Some(&(t0, h0)) = s
+    /// Nonces hashed since start, all GPUs.
+    pub fn hashes(&self) -> u64 {
+        self.gpus
             .iter()
-            .find(|(t, _)| t1.duration_since(*t) <= window)
-            .filter(|(t, _)| *t < t1)
-        else {
-            return 0.0;
-        };
-        (h1 - h0) as f64 / t1.duration_since(t0).as_secs_f64()
+            .map(|g| g.hashes.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Records a hashrate sample (call every few seconds).
+    pub fn sample(&self) {
+        let now = Instant::now();
+        for g in &self.gpus {
+            push_sample(&mut lock(&g.samples), now, g.hashes.load(Ordering::Relaxed));
+        }
+        push_sample(&mut lock(&self.samples), now, self.hashes());
+    }
+
+    /// Hashes per second over the last `window`, all GPUs.
+    pub fn hashrate(&self, window: Duration) -> f64 {
+        rate(&lock(&self.samples), window)
     }
 
     /// Seconds since start.
@@ -142,18 +244,20 @@ impl Stats {
         *lock(&self.difficulty) = d;
     }
 
-    /// What the GPU is doing.
-    pub fn set_gpu(&self, g: GpuState) {
-        *lock(&self.gpu) = g;
+    /// Share `seq` was found by GPU `gpu` (an index into [`Stats::gpus`]).
+    pub fn share_sent(&self, seq: u64, gpu: usize) {
+        lock(&self.owners).insert(seq, gpu);
     }
 
-    /// The device name and its latest reading.
-    pub fn set_device(&self, name: &str, r: DeviceReading) {
-        *lock(&self.device) = (name.to_string(), r);
-    }
-
-    /// A share answer.
-    pub fn share_result(&self, accepted: bool, error: Option<&str>, latency: Duration) {
+    /// The answer to share `seq`.
+    pub fn share_result(&self, seq: u64, accepted: bool, error: Option<&str>, latency: Duration) {
+        if let Some(g) = lock(&self.owners)
+            .remove(&seq)
+            .and_then(|i| self.gpus.get(i))
+        {
+            let c = if accepted { &g.accepted } else { &g.refused };
+            c.fetch_add(1, Ordering::Relaxed);
+        }
         if accepted {
             self.accepted.fetch_add(1, Ordering::Relaxed);
             *lock(&self.last_accept) = Some(Instant::now());
@@ -176,16 +280,37 @@ impl Stats {
         *lock(&self.last_reject) = Some(e.to_string());
     }
 
-    /// One status line.
-    pub fn line(&self) -> String {
-        let (name, r) = lock(&self.device).clone();
-        let _ = name;
-        let up = self.uptime().as_secs();
-        let gpu = match &*lock(&self.gpu) {
-            GpuState::Idle => "idle".to_string(),
-            GpuState::BuildingDag(e) => format!("building DAG {e}"),
-            GpuState::Mining => "mining".to_string(),
+    /// The GPUs' states: "mining" when all mine, else e.g. "mining 6/7,
+    /// building DAG 609".
+    fn states(&self) -> String {
+        let states: Vec<GpuState> = self.gpus.iter().map(|g| lock(&g.state).clone()).collect();
+        let mining = states.iter().filter(|s| **s == GpuState::Mining).count();
+        if mining == states.len() {
+            return "mining".to_string();
+        }
+        let mut s = if states.len() > 1 {
+            format!("mining {mining}/{}", states.len())
+        } else {
+            String::new()
         };
+        let mut others: Vec<String> = states
+            .iter()
+            .filter(|s| **s != GpuState::Mining)
+            .map(state_name)
+            .collect();
+        others.dedup();
+        for o in others {
+            if !s.is_empty() {
+                s.push_str(", ");
+            }
+            s.push_str(&o);
+        }
+        s
+    }
+
+    /// The status line (with the card's readings when there is one GPU).
+    pub fn line(&self) -> String {
+        let up = self.uptime().as_secs();
         let job = lock(&self.job)
             .clone()
             .map_or_else(|| "-".to_string(), |(_, h)| format!("h{h}"));
@@ -201,21 +326,16 @@ impl Stats {
             self.lost.load(Ordering::Relaxed),
             *lock(&self.difficulty),
             job,
-            gpu,
+            self.states(),
             if self.connected.load(Ordering::Relaxed) {
                 lock(&self.pool).clone()
             } else {
                 "no pool".to_string()
             },
         );
-        if let Some(t) = r.temperature_c {
-            s.push_str(&format!("  {t}C"));
-        }
-        if let Some(p) = r.power_w {
-            s.push_str(&format!(" {p:.0}W"));
-        }
-        if let Some(f) = r.fan_pct {
-            s.push_str(&format!(" fan {f}%"));
+        if let [g] = self.gpus.as_slice() {
+            s.push(' ');
+            s.push_str(&reading_text(&lock(&g.reading).1));
         }
         let ge = self.gpu_errors.load(Ordering::Relaxed);
         if ge > 0 {
@@ -224,20 +344,68 @@ impl Stats {
         s
     }
 
+    /// One line per GPU (none with a single GPU: [`Stats::line`] has it).
+    pub fn gpu_lines(&self) -> Vec<String> {
+        if self.gpus.len() < 2 {
+            return Vec::new();
+        }
+        self.gpus
+            .iter()
+            .map(|g| {
+                let st = lock(&g.state).clone();
+                format!(
+                    "  gpu{:<2} {:6.2} MH/s (10 min {:.2})  A{} R{} {}{}",
+                    g.device,
+                    g.hashrate(Duration::from_secs(60)) / 1e6,
+                    g.hashrate(Duration::from_secs(600)) / 1e6,
+                    g.accepted.load(Ordering::Relaxed),
+                    g.refused.load(Ordering::Relaxed),
+                    if st == GpuState::Mining {
+                        String::new()
+                    } else {
+                        format!("{} ", state_name(&st))
+                    },
+                    reading_text(&lock(&g.reading).1),
+                )
+            })
+            .collect()
+    }
+
     /// Everything, for the JSON API.
     pub fn json(&self) -> Value {
-        let (name, r) = lock(&self.device).clone();
         let lat = lock(&self.latency_ms).clone();
         let avg_lat = if lat.is_empty() {
             Value::Null
         } else {
             json!(lat.iter().sum::<u64>() / lat.len() as u64)
         };
-        let gpu = match &*lock(&self.gpu) {
-            GpuState::Idle => json!({"state": "idle"}),
-            GpuState::BuildingDag(e) => json!({"state": "building_dag", "epoch": e}),
-            GpuState::Mining => json!({"state": "mining"}),
-        };
+        let gpus: Vec<Value> = self
+            .gpus
+            .iter()
+            .map(|g| {
+                let (name, r) = lock(&g.reading).clone();
+                json!({
+                    "device": g.device,
+                    "name": name,
+                    "state": state_json(&lock(&g.state)),
+                    "hashrate": {
+                        "1m": g.hashrate(Duration::from_secs(60)),
+                        "10m": g.hashrate(Duration::from_secs(600)),
+                        "total_hashes": g.hashes.load(Ordering::Relaxed),
+                    },
+                    "shares": {
+                        "accepted": g.accepted.load(Ordering::Relaxed),
+                        "refused": g.refused.load(Ordering::Relaxed),
+                    },
+                    "temperature_c": r.temperature_c,
+                    "power_w": r.power_w,
+                    "power_limit_w": r.power_limit_w,
+                    "fan_pct": r.fan_pct,
+                    "mem_clock_mhz": r.mem_clock_mhz,
+                    "sm_clock_mhz": r.sm_clock_mhz,
+                })
+            })
+            .collect();
         json!({
             "miner": format!("quai-kawpow-miner/{}", env!("CARGO_PKG_VERSION")),
             "uptime_s": self.uptime().as_secs(),
@@ -246,7 +414,7 @@ impl Stats {
             "hashrate": {
                 "1m": self.hashrate(Duration::from_secs(60)),
                 "10m": self.hashrate(Duration::from_secs(600)),
-                "total_hashes": self.hashes.load(Ordering::Relaxed),
+                "total_hashes": self.hashes(),
             },
             "shares": {
                 "accepted": self.accepted.load(Ordering::Relaxed),
@@ -260,16 +428,7 @@ impl Stats {
             },
             "difficulty": *lock(&self.difficulty),
             "job": lock(&self.job).clone().map(|(id, h)| json!({"id": id, "height": h, "epoch": h / 7500})),
-            "gpu": gpu,
-            "device": {
-                "name": name,
-                "temperature_c": r.temperature_c,
-                "power_w": r.power_w,
-                "power_limit_w": r.power_limit_w,
-                "fan_pct": r.fan_pct,
-                "mem_clock_mhz": r.mem_clock_mhz,
-                "sm_clock_mhz": r.sm_clock_mhz,
-            },
+            "gpus": gpus,
         })
     }
 }
@@ -280,15 +439,37 @@ mod tests {
 
     #[test]
     fn classifies_share_answers() {
-        let s = Stats::default();
-        s.share_result(true, None, Duration::from_millis(15));
-        s.share_result(false, Some("nojob"), Duration::ZERO);
-        s.share_result(false, Some("no response"), Duration::ZERO);
-        s.share_result(false, Some("share difficulty below target"), Duration::ZERO);
+        let s = Stats::new(&[0, 3]);
+        s.share_sent(1, 1);
+        s.share_sent(2, 1);
+        s.share_sent(3, 0);
+        s.share_result(1, true, None, Duration::from_millis(15));
+        s.share_result(2, false, Some("nojob"), Duration::ZERO);
+        s.share_result(3, false, Some("no response"), Duration::ZERO);
+        s.share_result(4, false, Some("share difficulty below target"), Duration::ZERO);
         assert_eq!(s.accepted.load(Ordering::Relaxed), 1);
         assert_eq!(s.stale.load(Ordering::Relaxed), 1);
         assert_eq!(s.lost.load(Ordering::Relaxed), 1);
         assert_eq!(s.rejected.load(Ordering::Relaxed), 1);
         assert_eq!(s.json()["shares"]["avg_latency_ms"], 15);
+        // Per GPU: the second GPU (device 3) found shares 1 and 2.
+        let g = &s.json()["gpus"][1];
+        assert_eq!(g["device"], 3);
+        assert_eq!(g["shares"]["accepted"], 1);
+        assert_eq!(g["shares"]["refused"], 1);
+        assert_eq!(s.gpus()[0].refused.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn summarizes_gpu_states() {
+        let s = Stats::new(&[0, 1, 2]);
+        for g in s.gpus() {
+            g.set_state(GpuState::Mining);
+        }
+        assert_eq!(s.states(), "mining");
+        s.gpus()[2].set_state(GpuState::BuildingDag(609));
+        assert_eq!(s.states(), "mining 2/3, building DAG 609");
+        assert_eq!(s.gpu_lines().len(), 3);
+        assert!(Stats::new(&[0]).gpu_lines().is_empty());
     }
 }

@@ -7,7 +7,8 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use quai_kawpow_miner::tune::{TuneConfig, Tuning};
 use qkm_core::kernel::{DagLoad, SearchParams, search_source};
 use qkm_core::{Epoch, Program, Verifier, boundary64, meets, period};
 use qkm_cuda::{Dag, Geometry, Gpu, Header, Kernels, Searcher, compile_cubin};
@@ -22,11 +23,51 @@ const DEFAULT_HEIGHT: u64 = 4_565_235;
     about = "KawPoW GPU miner for Quai Network"
 )]
 struct Cli {
-    /// CUDA device index.
-    #[arg(long, global = true, default_value_t = 0)]
-    device: usize,
+    /// CUDA device index (default 0; for `mine`, the only GPU to use).
+    #[arg(long, global = true)]
+    device: Option<usize>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// GPU settings (setting them needs root; they last until reset or reboot).
+#[derive(Args, Clone, Default)]
+struct TuneArgs {
+    /// Power limit, watts.
+    #[arg(long, value_name = "W")]
+    power_limit: Option<u32>,
+    /// Lock the core clock to MIN,MAX MHz (or one value for both).
+    #[arg(long, value_name = "MIN,MAX", value_delimiter = ',', num_args = 1..=2)]
+    lock_core_clocks: Option<Vec<u32>>,
+    /// Lock the memory clock to MIN,MAX MHz (or one value for both).
+    #[arg(long, value_name = "MIN,MAX", value_delimiter = ',', num_args = 1..=2)]
+    lock_mem_clocks: Option<Vec<u32>>,
+    /// Core clock offset, MHz.
+    #[arg(long, value_name = "MHZ", allow_hyphen_values = true)]
+    core_offset: Option<i32>,
+    /// Memory clock offset, MHz.
+    #[arg(long, value_name = "MHZ", allow_hyphen_values = true)]
+    mem_offset: Option<i32>,
+    /// Fan speed, percent (turns automatic fan control off until reset).
+    #[arg(long, value_name = "PCT")]
+    fan: Option<u32>,
+}
+
+impl TuneArgs {
+    fn tuning(&self) -> Tuning {
+        let pair = |v: &Option<Vec<u32>>| {
+            v.as_ref()
+                .map(|v| [v[0], *v.get(1).unwrap_or(&v[0])])
+        };
+        Tuning {
+            power_limit: self.power_limit,
+            lock_core_clocks: pair(&self.lock_core_clocks),
+            lock_mem_clocks: pair(&self.lock_mem_clocks),
+            core_offset: self.core_offset,
+            mem_offset: self.mem_offset,
+            fan: self.fan,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -59,6 +100,34 @@ enum Cmd {
         /// Never build the next epoch's DAG ahead.
         #[arg(long)]
         no_dag_prefetch: bool,
+        /// CUDA devices to mine on, e.g. `0,1,2`, or `all` (the default):
+        /// one process, one stratum connection and one worker for them all.
+        #[arg(long)]
+        devices: Option<String>,
+        /// Seconds between one GPU's DAG build and the next GPU's, so the
+        /// GPUs don't change load all at once.
+        #[arg(long, value_name = "SECS")]
+        start_stagger: Option<f64>,
+        #[command(flatten)]
+        tune: TuneArgs,
+    },
+    /// Apply GPU settings (power limit, clocks, fans) and exit; needs root.
+    /// Takes the same settings as `mine` (flags or the config's `[tune]`).
+    Tune {
+        /// CUDA devices, e.g. `0,1,2`, or `all` (the default).
+        #[arg(long)]
+        devices: Option<String>,
+        /// TOML configuration (its `[tune]` section; flags win).
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Print each GPU's current settings instead.
+        #[arg(long)]
+        show: bool,
+        /// Put each GPU back to its defaults instead.
+        #[arg(long, conflicts_with = "show")]
+        reset: bool,
+        #[command(flatten)]
+        tune: TuneArgs,
     },
     /// Compare the GPU's mix digests and final hashes with rsq-pow's, and
     /// check that every solution the search kernel reports verifies.
@@ -509,9 +578,13 @@ fn bench(
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     device: Option<usize>,
+    devices: Option<Vec<usize>>,
     api: Option<std::net::SocketAddr>,
     status_secs: Option<u64>,
     dag_prefetch: Option<bool>,
+    start_stagger: Option<f64>,
+    #[serde(default)]
+    tune: TuneConfig,
     #[serde(default, rename = "pool")]
     pools: Vec<FilePool>,
 }
@@ -546,7 +619,8 @@ fn password(pass: &str, token_file: Option<&std::path::Path>) -> Result<String, 
 
 #[allow(clippy::too_many_arguments)]
 fn mine(
-    device: usize,
+    device: Option<usize>,
+    devices: Option<String>,
     pools: Vec<String>,
     user: Option<String>,
     pass: String,
@@ -555,20 +629,15 @@ fn mine(
     api: Option<std::net::SocketAddr>,
     status_secs: Option<u64>,
     no_dag_prefetch: bool,
+    start_stagger: Option<f64>,
+    tune: Tuning,
 ) -> Result<(), String> {
     use quai_kawpow_miner::miner::{MinerConfig, run as run_miner};
     use quai_kawpow_miner::stats::Stats;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let file: FileConfig = match &config {
-        Some(p) => {
-            let text = std::fs::read_to_string(p)
-                .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-            toml::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))?
-        }
-        None => FileConfig::default(),
-    };
+    let file = read_config(config.as_deref())?;
     let pool_list = if pools.is_empty() {
         file.pools
             .iter()
@@ -596,10 +665,15 @@ fn mine(
         return Err("no pool: give --pool or a [[pool]] in --config".into());
     }
     let mut cfg = MinerConfig::new(pool_list);
-    cfg.device = file.device.unwrap_or(device);
+    cfg.devices = mine_devices(devices.as_deref(), device, &file)?;
     cfg.status_every = Duration::from_secs(status_secs.or(file.status_secs).unwrap_or(30).max(1));
     cfg.dag_prefetch = !no_dag_prefetch && file.dag_prefetch.unwrap_or(true);
-    let stats = Arc::new(Stats::default());
+    let stagger = start_stagger.or(file.start_stagger).unwrap_or(5.0);
+    cfg.start_stagger = Duration::try_from_secs_f64(stagger)
+        .map_err(|_| format!("bad --start-stagger {stagger}"))?;
+    cfg.tune = file.tune.with(&tune);
+    cfg.tune.check()?;
+    let stats = Arc::new(Stats::new(&cfg.devices));
     if let Some(addr) = api.or(file.api) {
         let bound = quai_kawpow_miner::api::serve(addr, stats.clone())
             .map_err(|e| format!("API on {addr}: {e}"))?;
@@ -612,7 +686,108 @@ fn mine(
     run_miner(cfg, stop, stats)
 }
 
+fn read_config(path: Option<&std::path::Path>) -> Result<FileConfig, String> {
+    match path {
+        Some(p) => {
+            let text = std::fs::read_to_string(p)
+                .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+            toml::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))
+        }
+        None => Ok(FileConfig::default()),
+    }
+}
+
+/// `tune`: apply, show or reset the GPU settings.
+fn tune(
+    devices: Option<String>,
+    device: Option<usize>,
+    config: Option<std::path::PathBuf>,
+    show: bool,
+    reset: bool,
+    flags: Tuning,
+) -> Result<(), String> {
+    let file = read_config(config.as_deref())?;
+    let devices = mine_devices(devices.as_deref(), device, &file)?;
+    let tc = file.tune.with(&flags);
+    tc.check()?;
+    if !show && !reset && tc.is_empty() {
+        return Err("nothing to set: give settings (see --help), --show or --reset".into());
+    }
+    let nvml = nvml_wrapper::Nvml::init().map_err(|e| format!("NVML: {e}"))?;
+    let mut failed = false;
+    for d in devices {
+        let id = qkm_cuda::pci_bus_id(d).map_err(|e| e.to_string())?;
+        let (line, ok) = if show {
+            (quai_kawpow_miner::tune::show(&nvml, &id), true)
+        } else if reset {
+            quai_kawpow_miner::tune::reset(&nvml, &id)
+        } else {
+            let t = tc.for_device(d);
+            if t.is_empty() {
+                continue;
+            }
+            let a = quai_kawpow_miner::tune::apply(&nvml, &id, &t);
+            (a.text, a.failed == 0)
+        };
+        failed |= !ok;
+        println!("gpu{d} ({id}): {line}");
+    }
+    if failed {
+        return Err("some settings were not applied (see above)".into());
+    }
+    Ok(())
+}
+
+/// The GPUs to mine on: `--devices`, else `--device`, else the config's
+/// `devices` or `device`, else every GPU.
+fn mine_devices(
+    devices: Option<&str>,
+    device: Option<usize>,
+    file: &FileConfig,
+) -> Result<Vec<usize>, String> {
+    let list = match devices {
+        Some(d) if d.trim() != "all" => parse_devices(d)?,
+        Some(_) => Vec::new(),
+        None => match (device, &file.devices, file.device) {
+            (Some(d), ..) => vec![d],
+            (None, Some(ds), _) => ds.clone(),
+            (None, None, Some(d)) => vec![d],
+            (None, None, None) => Vec::new(),
+        },
+    };
+    let count = qkm_cuda::device_count().map_err(|e| e.to_string())?;
+    if count == 0 {
+        return Err("no CUDA device".into());
+    }
+    if list.is_empty() {
+        return Ok((0..count).collect());
+    }
+    if let Some(d) = list.iter().find(|&&d| d >= count) {
+        return Err(format!("no CUDA device {d} (there are {count})"));
+    }
+    Ok(list)
+}
+
+/// `0,1,2` → [0, 1, 2], refusing repeats.
+fn parse_devices(s: &str) -> Result<Vec<usize>, String> {
+    let mut out: Vec<usize> = Vec::new();
+    for p in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let d = p
+            .parse()
+            .map_err(|_| format!("bad device {p:?} in --devices (want e.g. 0,1,2 or all)"))?;
+        if out.contains(&d) {
+            return Err(format!("device {d} given twice in --devices"));
+        }
+        out.push(d);
+    }
+    if out.is_empty() {
+        return Err("--devices is empty".into());
+    }
+    Ok(out)
+}
+
 fn run(cli: Cli) -> Result<(), String> {
+    let device = cli.device.unwrap_or(0);
     match cli.cmd {
         Cmd::Mine {
             pools,
@@ -623,8 +798,12 @@ fn run(cli: Cli) -> Result<(), String> {
             api,
             status_secs,
             no_dag_prefetch,
+            devices,
+            start_stagger,
+            tune: t,
         } => mine(
             cli.device,
+            devices,
             pools,
             user,
             pass,
@@ -633,7 +812,16 @@ fn run(cli: Cli) -> Result<(), String> {
             api,
             status_secs,
             no_dag_prefetch,
+            start_stagger,
+            t.tuning(),
         ),
+        Cmd::Tune {
+            devices,
+            config,
+            show,
+            reset,
+            tune: t,
+        } => tune(devices, cli.device, config, show, reset, t.tuning()),
         Cmd::Kernel { height } => {
             let e = Epoch::for_height(height);
             print!(
@@ -647,7 +835,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Cmd::Compile { height, block } => {
-            let gpu = Gpu::new(cli.device).map_err(|e| e.to_string())?;
+            let gpu = Gpu::new(device).map_err(|e| e.to_string())?;
             let e = Epoch::for_height(height);
             let src = search_source(
                 &Program::new(period(height)),
@@ -682,7 +870,7 @@ fn run(cli: Cli) -> Result<(), String> {
             block,
             seed,
         } => {
-            let gpu = Gpu::new(cli.device).map_err(|e| e.to_string())?;
+            let gpu = Gpu::new(device).map_err(|e| e.to_string())?;
             println!("{} (sm_{}{})", gpu.name, gpu.arch.0, gpu.arch.1);
             verify(&gpu, &heights, cases, block, seed)
         }
@@ -701,7 +889,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 .iter()
                 .map(|s| DagLoad::parse(s).ok_or(format!("unknown DAG load {s}")))
                 .collect::<Result<Vec<_>, _>>()?;
-            let gpu = Gpu::new(cli.device).map_err(|e| e.to_string())?;
+            let gpu = Gpu::new(device).map_err(|e| e.to_string())?;
             println!("{} (sm_{}{})", gpu.name, gpu.arch.0, gpu.arch.1);
             bench(
                 &gpu,

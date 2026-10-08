@@ -82,10 +82,16 @@ matters little (block 256, grid 256, two streams is the default); a DAG from
 
     export LD_LIBRARY_PATH=/opt/cuda/lib64   # libnvrtc
 
-    # Mine through a Quai node's stratum (rs-quai or go-quai, KawPoW port 3333).
+    # Mine through a Quai node's stratum (rs-quai or go-quai, KawPoW port 3333)
+    # on every GPU: one process, one connection, one worker.
     quai-kawpow-miner mine --pool stratum+tcp://10.0.0.13:3333 \
-        --user 0xYOUR_QUAI_ADDRESS.rig1 --pass d=0.2 \
+        --user 0xYOUR_QUAI_ADDRESS.rig1 --pass d=1 \
         --auth-token-file ~/.config/quai/stratum-token --api 127.0.0.1:4073
+
+    # GPU settings (root): power limit, locked clocks, offsets, fans.
+    sudo quai-kawpow-miner tune --power-limit 150 --lock-core-clocks 1400,1600
+    quai-kawpow-miner tune --show
+    sudo quai-kawpow-miner tune --reset
 
     quai-kawpow-miner verify                 # GPU vs rsq-pow
     quai-kawpow-miner bench --height 4565235 --seconds 30
@@ -96,17 +102,41 @@ matters little (block 256, grid 256, two streams is the default); a DAG from
   failover, in order of preference. The miner returns to the first pool
   after ten minutes on a backup.
 - `--user` is your payout address plus a worker name.
+- `--devices 0,1,2` picks the GPUs (default `all`). They share one stratum
+  connection and worker, the light cache and the compiled kernels; each
+  searches its own part of the nonce space. The status line gives the total,
+  then a line per GPU with its hashrate, shares, temperature and power.
 - `--pass` holds the pool options; `d=0.2` fixes the stratum difficulty (one
-  share about every 30 s at 30 MH/s; without it the node's vardiff starts at
-  50 and takes minutes to come down).
+  share about every 30 s at 30 MH/s; scale it with the rig, e.g. `d=1` for
+  150 MH/s; without it the node's vardiff starts at 50 and takes minutes to
+  come down).
+- `--start-stagger SECS` (default 5): the n-th GPU builds its DAG n times this
+  after the first, so the GPUs don't all change load at once.
+- `--power-limit W`, `--lock-core-clocks MIN,MAX`, `--lock-mem-clocks MIN,MAX`,
+  `--core-offset MHZ`, `--mem-offset MHZ`, `--fan PCT`: GPU settings, applied
+  before any GPU hashes. They need root; without it the miner says so in one
+  line and mines with the settings as they are, so apply them first with
+  `sudo quai-kawpow-miner tune` (same flags or config). They last until
+  `tune --reset`, a reboot or a driver reload. Locked core clocks also stop
+  the power spikes of a card leaving its power cap, which can trip a rig's
+  power supplies.
 - `--auth-token-file` reads the stratum token (sent as `auth=<token>`); it is
   never logged and never appears on the command line.
 - `--api ADDR` serves the stats as JSON (`curl http://127.0.0.1:4073/`).
 - `--config miner.toml` holds the same settings:
 
-      device = 0
+      devices = [0, 1, 2]        # default: every GPU
       api = "127.0.0.1:4073"
       status_secs = 60
+      start_stagger = 5
+
+      [tune]                     # every GPU
+      power_limit = 150
+      lock_core_clocks = [1400, 1600]
+
+      [tune.gpu.2]               # device 2's own settings
+      power_limit = 140
+      fan = 70
 
       [[pool]]
       url = "stratum+tcp://10.0.0.13:3333"
@@ -120,7 +150,7 @@ matters little (block 256, grid 256, two streams is the default); a DAG from
       pass = "d=0.2"
 
 How it stays up:
-- **Epochs.** The GPU thread alone owns the DAG, so an epoch change can't
+- **Epochs.** Each GPU's thread alone owns its DAG, so an epoch change can't
   race a build. Near the end of an epoch, the next light cache and the next
   epoch's first kernel are prepared ahead, and the next DAG too when the card
   holds two. A job from a far epoch (a stale template) is followed only when

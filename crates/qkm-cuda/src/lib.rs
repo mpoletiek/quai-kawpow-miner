@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CString, c_char};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use cudarc::driver::{
@@ -61,6 +61,52 @@ impl Header {
     }
 }
 
+/// The number of CUDA devices.
+pub fn device_count() -> Result<usize> {
+    cudarc::driver::result::init()?;
+    Ok(cudarc::driver::result::device::get_count()? as usize)
+}
+
+/// The PCI bus id of CUDA device `ordinal` as NVML names it
+/// (`00000000:01:00.0`), without creating a context. CUDA and NVML may
+/// number the GPUs differently; the bus id is what they agree on.
+pub fn pci_bus_id(ordinal: usize) -> Result<String> {
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    cudarc::driver::result::init()?;
+    let dev = cudarc::driver::result::device::get(ordinal as i32)?;
+    // SAFETY: a valid device handle and valid attributes.
+    let attr = |a| unsafe { cudarc::driver::result::device::get_attribute(dev, a) };
+    let dom = attr(A::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID)?;
+    let bus = attr(A::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID)?;
+    let slot = attr(A::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)?;
+    Ok(format!("{dom:08x}:{bus:02x}:{slot:02x}.0"))
+}
+
+/// The DAG kernels' CUBIN for `arch`, compiled once per process (every GPU
+/// of a rig builds its DAG at the same moment, on a CPU with few cores).
+fn dag_cubin(arch: (i32, i32)) -> Result<Vec<u8>> {
+    type Cell = Arc<OnceLock<Result<Vec<u8>>>>;
+    static CUBINS: Mutex<Vec<((i32, i32), Cell)>> = Mutex::new(Vec::new());
+    let cell = {
+        let mut c = CUBINS.lock().unwrap_or_else(|e| e.into_inner());
+        match c.iter().find(|(a, _)| *a == arch) {
+            Some((_, cell)) => cell.clone(),
+            None => {
+                let cell = Cell::default();
+                c.push((arch, cell.clone()));
+                cell
+            }
+        }
+    };
+    let r = cell.get_or_init(|| compile_cubin(DAG_SOURCE, arch)).clone();
+    if r.is_err() {
+        // Not cached: the next build tries again.
+        let mut c = CUBINS.lock().unwrap_or_else(|e| e.into_inner());
+        c.retain(|(_, x)| !Arc::ptr_eq(x, &cell));
+    }
+    r
+}
+
 /// Compiles CUDA C to a CUBIN for `sm_{major}{minor}`.
 pub fn compile_cubin(src: &str, arch: (i32, i32)) -> Result<Vec<u8>> {
     let csrc = CString::new(src).map_err(|e| Error(e.to_string()))?;
@@ -108,6 +154,20 @@ pub struct Gpu {
 impl Gpu {
     /// Opens device `ordinal`.
     pub fn new(ordinal: usize) -> Result<Gpu> {
+        // Waits sleep until the GPU interrupts instead of spinning: with
+        // several GPUs on a two-core rig, spinning threads starve each
+        // other's launches (7 miners there: 100% CPU and 15% less hashrate).
+        // Set before the primary context is retained, while it is inactive.
+        cudarc::driver::result::init()?;
+        let dev = cudarc::driver::result::device::get(ordinal as i32)?;
+        // SAFETY: a valid device handle; the flag is a valid scheduling mode.
+        unsafe {
+            cudarc::driver::sys::cuDevicePrimaryCtxSetFlags_v2(
+                dev,
+                cudarc::driver::sys::CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC as u32,
+            )
+            .result()?;
+        }
         let ctx = CudaContext::new(ordinal)?;
         // Each stream owns its buffers and the DAG is finished before any
         // search, so cudarc's cross-stream event tracking is only overhead.
@@ -147,7 +207,7 @@ impl Gpu {
     /// Builds the DAG of `epoch` from its light cache (u32 words) on the GPU.
     pub fn generate_dag(&self, epoch: Epoch, light: &[u32]) -> Result<Dag> {
         let stream = self.ctx.default_stream();
-        let module = self.load(compile_cubin(DAG_SOURCE, self.arch)?)?;
+        let module = self.load(dag_cubin(self.arch)?)?;
         let fs = DAG_FNS
             .iter()
             .map(|n| module.load_function(n))
@@ -250,13 +310,59 @@ pub struct SearchKernel {
     hash: CudaFunction,
 }
 
-type Pending = JoinHandle<Result<Vec<u8>>>;
+type Pending = JoinHandle<Result<Arc<Vec<u8>>>>;
+type CubinCell = Arc<OnceLock<Result<Arc<Vec<u8>>>>>;
+/// (arch, period, DAG elements).
+type CubinKey = ((i32, i32), u64, u32);
+
+/// Search-kernel CUBINs shared by the GPUs of one process: each (arch,
+/// period, DAG size) is compiled once, by whichever GPU asks first, and the
+/// others wait for it.
+pub struct Cubins {
+    params: SearchParams,
+    map: Mutex<HashMap<CubinKey, CubinCell>>,
+}
+
+impl Cubins {
+    /// For the tunables baked into each module.
+    pub fn new(params: SearchParams) -> Cubins {
+        Cubins {
+            params,
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The CUBIN for `arch`, period `per` and a DAG of `dag_elements`.
+    pub fn get(&self, arch: (i32, i32), per: u64, dag_elements: u32) -> Result<Arc<Vec<u8>>> {
+        let key = (arch, per, dag_elements);
+        let cell = {
+            let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            // Keep the periods around this one only.
+            m.retain(|k, _| k.1 + 2 >= per);
+            m.entry(key).or_default().clone()
+        };
+        let r = cell
+            .get_or_init(|| {
+                compile_cubin(&source_for(per, dag_elements, self.params), arch).map(Arc::new)
+            })
+            .clone();
+        if r.is_err() {
+            // Not cached: the next request tries again.
+            let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            if m.get(&key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+                m.remove(&key);
+            }
+        }
+        r
+    }
+}
 
 /// Search kernels by period, with the next period compiled in the
 /// background (a new program every 3 heights).
 pub struct Kernels {
     arch: (i32, i32),
     params: SearchParams,
+    cubins: Arc<Cubins>,
     ready: HashMap<(u64, u32), Arc<SearchKernel>>,
     pending: Mutex<HashMap<(u64, u32), Pending>>,
 }
@@ -268,9 +374,15 @@ fn source_for(per: u64, dag_elements: u32, params: SearchParams) -> String {
 impl Kernels {
     /// For a device and the tunables baked into each module.
     pub fn new(gpu: &Gpu, params: SearchParams) -> Kernels {
+        Kernels::shared(gpu, Arc::new(Cubins::new(params)))
+    }
+
+    /// For a device, with CUBINs shared with other devices.
+    pub fn shared(gpu: &Gpu, cubins: Arc<Cubins>) -> Kernels {
         Kernels {
             arch: gpu.arch,
-            params,
+            params: cubins.params,
+            cubins,
             ready: HashMap::new(),
             pending: Mutex::new(HashMap::new()),
         }
@@ -286,10 +398,10 @@ impl Kernels {
         if p.contains_key(&key) {
             return;
         }
-        let (arch, params) = (self.arch, self.params);
+        let (arch, cubins) = (self.arch, self.cubins.clone());
         p.insert(
             key,
-            std::thread::spawn(move || compile_cubin(&source_for(per, dag_elements, params), arch)),
+            std::thread::spawn(move || cubins.get(arch, per, dag_elements)),
         );
     }
 
@@ -309,9 +421,9 @@ impl Kernels {
                 Some(j) => j
                     .join()
                     .map_err(|_| Error("compile thread panicked".into()))??,
-                None => compile_cubin(&source_for(per, de, self.params), self.arch)?,
+                None => self.cubins.get(self.arch, per, de)?,
             };
-            let module = gpu.load(cubin)?;
+            let module = gpu.load(cubin.as_ref().clone())?;
             let search = module.load_function(SEARCH_FN)?;
             let hash = module.load_function(HASH_FN)?;
             // Keep the current and the next period only.
