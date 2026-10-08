@@ -74,14 +74,33 @@ fn send_line(s: &Mutex<TcpStream>, line: &str) -> bool {
 }
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim_start_matches("0x");
-    if !s.len().is_multiple_of(2) {
-        return None;
+    crate::proto::unhex(s).ok()
+}
+
+/// rs-quai's checks at `mining.authorize`: the payout address must be in
+/// the node's zone (cyprus1 here: first byte 0x00), `lock` must be 0..3,
+/// and the token must match when one is required. Options are separated
+/// by `,` or `_`.
+fn authorize_error(user: &str, pass: &str, token: Option<&str>) -> Option<&'static str> {
+    let address = user.split('.').next().unwrap_or("");
+    let zone_ok = unhex(address).is_some_and(|b| b.first() == Some(&0x00));
+    if !zone_ok {
+        return Some("address is not internal to this zone");
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    let opts: Vec<&str> = pass.split([',', '_']).collect();
+    for o in &opts {
+        if let Some(l) = o.strip_prefix("lock=")
+            && !l.parse::<u8>().is_ok_and(|v| v <= 3)
+        {
+            return Some("invalid lock value");
+        }
+    }
+    if let Some(t) = token
+        && !opts.iter().any(|o| o.strip_prefix("auth=") == Some(t))
+    {
+        return Some("unauthorized");
+    }
+    None
 }
 
 impl MockPool {
@@ -299,13 +318,13 @@ fn serve(conn: TcpStream, sh: &Arc<Mutex<Shared>>, v: &Verifier) {
                 respond(&out, &id, json!([null, "c2"]), Value::Null);
             }
             "mining.authorize" => {
-                let ok = lock(sh)
-                    .token
-                    .as_ref()
-                    .is_none_or(|t| p(1).split(',').any(|kv| kv == format!("auth={t}")));
-                if !ok {
-                    respond(&out, &id, Value::Bool(false), json!("unauthorized"));
-                    return;
+                let token = lock(sh).token.clone();
+                if let Some(e) = authorize_error(&p(0), &p(1), token.as_deref()) {
+                    respond(&out, &id, Value::Bool(false), json!(e));
+                    if e == "unauthorized" {
+                        return;
+                    }
+                    continue;
                 }
                 respond(&out, &id, Value::Bool(true), Value::Null);
                 let mut g = lock(sh);

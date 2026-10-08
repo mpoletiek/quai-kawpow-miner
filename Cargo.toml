@@ -10,7 +10,8 @@ license = "GPL-3.0-only"
 repository = "https://github.com/mpoletiek/quai-kawpow-miner"
 
 [workspace.dependencies]
-rsq-pow = { git = "https://github.com/mpoletiek/rs-quai.git", branch = "main" }
+# Pinned: the KawPoW every share is checked against; move it deliberately.
+rsq-pow = { git = "https://github.com/mpoletiek/rs-quai.git", rev = "dbd388df6424932ec854e40737cc11975a4d7b58" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

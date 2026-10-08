@@ -248,3 +248,89 @@ fn an_unanswered_share_times_out() {
     );
     c.stop();
 }
+
+#[test]
+fn every_pool_refusing_is_fatal() {
+    // A Qi/Quai address from another zone (first byte 0x01), then a bad lock.
+    let a = MockPool::start(easy_target(), None);
+    let b = MockPool::start(easy_target(), None);
+    let mut other_zone = pool(&a.addr(), "d=1");
+    other_zone.user = "0x01050723a3F8e87f704bb78014FE7791FAf344F5.test".into();
+    let bad_lock = pool(&b.addr(), "d=1,lock=7");
+    let (tx, rx) = channel();
+    let c = Client::start(quick(vec![other_zone, bad_lock]), tx);
+    let seen = wait_for(&rx, 20, |e| matches!(e, Event::Fatal(_)));
+    let Some(Event::Fatal(why)) = seen.last() else { panic!() };
+    assert!(why.contains("not internal to this zone"), "{why}");
+    assert!(why.contains("invalid lock value"), "{why}");
+    c.stop();
+}
+
+#[test]
+fn an_unanswered_authorize_reconnects() {
+    // Accepts connections and reads, never answers.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut keep = Vec::new();
+        for s in l.incoming().flatten() {
+            keep.push(s);
+        }
+    });
+    let (tx, rx) = channel();
+    let mut cfg = quick(vec![pool(&addr, "")]);
+    cfg.response_timeout = Duration::from_millis(500);
+    let c = Client::start(cfg, tx);
+    wait_for(&rx, 10, |e| {
+        matches!(e, Event::Disconnected { reason } if reason.contains("no answer to mining.subscribe"))
+    });
+    c.stop();
+}
+
+#[test]
+fn an_endless_line_ends_the_connection() {
+    use std::io::Write;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        if let Some(Ok(mut s)) = l.incoming().next() {
+            let chunk = vec![b'a'; 16 * 1024];
+            for _ in 0..8 {
+                if s.write_all(&chunk).is_err() {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+    let (tx, rx) = channel();
+    let c = Client::start(quick(vec![pool(&addr, "")]), tx);
+    wait_for(&rx, 10, |e| {
+        matches!(e, Event::Disconnected { reason } if reason.contains("longer than 64 KiB"))
+    });
+    c.stop();
+}
+
+#[test]
+fn goes_back_to_the_first_pool_once_it_answers() {
+    // The first pool is down at the start, then comes up on the same port.
+    let spare = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_addr = spare.local_addr().unwrap();
+    drop(spare);
+    let backup = MockPool::start(easy_target(), None);
+    backup.push_job(100, true);
+    let (tx, rx) = channel();
+    let mut cfg = quick(vec![pool(&first_addr.to_string(), ""), pool(&backup.addr(), "")]);
+    cfg.primary_retry = Duration::from_secs(1);
+    cfg.probe_every = Duration::from_millis(500);
+    let c = Client::start(cfg, tx);
+    wait_for(&rx, 20, |e| matches!(e, Event::Connected { pool: 1, .. }));
+    // Bring the first pool up where the client expects it.
+    let first = TcpListener::bind(first_addr).unwrap();
+    let seen = wait_for(&rx, 20, |e| matches!(e, Event::Connected { pool: 0, .. }));
+    assert!(seen.iter().any(
+        |e| matches!(e, Event::Disconnected { reason } if reason.contains("first pool answers again"))
+    ));
+    drop(first);
+    c.stop();
+}

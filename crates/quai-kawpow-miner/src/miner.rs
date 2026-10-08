@@ -13,7 +13,9 @@
 //! - the stratum client's threads, and the API thread when enabled.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel,
+};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +54,16 @@ pub struct MinerConfig {
     /// The n-th GPU waits n times this before each DAG build, so the GPUs
     /// don't change load all at once.
     pub start_stagger: Duration,
+    /// A GPU at this temperature (Celsius) pauses...
+    pub temp_limit: Option<u32>,
+    /// ...until it cools to this (default: 15 below the limit).
+    pub temp_resume: Option<u32>,
+    /// Report the hashrate to the pool (`eth_submitHashrate`) every minute.
+    pub report_hashrate: bool,
+    /// A GPU that mines but whose hash count does not move for this long is
+    /// stuck (a hung kernel or driver): the miner exits, for a supervisor
+    /// to restart it.
+    pub stall_timeout: Duration,
 }
 
 impl MinerConfig {
@@ -70,7 +82,17 @@ impl MinerConfig {
             far_epoch_confirm: Duration::from_secs(2),
             tune: TuneConfig::default(),
             start_stagger: Duration::ZERO,
+            temp_limit: None,
+            temp_resume: None,
+            report_hashrate: false,
+            stall_timeout: Duration::from_secs(120),
         }
+    }
+
+    /// Where a GPU paused at [`MinerConfig::temp_limit`] starts again.
+    pub fn temp_resume(&self) -> u32 {
+        self.temp_resume
+            .unwrap_or_else(|| self.temp_limit.unwrap_or(0).saturating_sub(15))
     }
 }
 
@@ -184,12 +206,13 @@ struct GpuCtx {
     /// Index into `Stats::gpus`, and the number of GPUs.
     index: usize,
     count: usize,
-    gpu: Arc<Gpu>,
+    /// `None` while the device could not be reopened after a reset.
+    gpu: Option<Arc<Gpu>>,
     cubins: Arc<Cubins>,
     slot: Arc<Slot>,
     stats: Arc<Stats>,
     verifier: Arc<Verifier>,
-    candidates: Sender<Candidate>,
+    candidates: SyncSender<Candidate>,
     stop: Arc<AtomicBool>,
     cfg: MinerConfig,
 }
@@ -198,48 +221,109 @@ fn gib(b: u64) -> f64 {
     b as f64 / f64::from(1u32 << 30)
 }
 
-/// The GPU thread. CUDA errors are logged and retried; they never end the
-/// miner.
-fn gpu_thread(c: GpuCtx) {
+/// Failures in a row (with no hashing in between) before the device's
+/// context is reset: a sticky CUDA error (an illegal address or ECC fault,
+/// often from too much overclock) ruins a context for good.
+const RESET_AFTER: u32 = 3;
+/// Failures in a row before the GPU is given up (the miner exits when
+/// every GPU has).
+const GIVE_UP_AFTER: u32 = 8;
+
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
+/// The GPU thread. Errors and panics are logged and retried after a pause;
+/// see [`RESET_AFTER`] and [`GIVE_UP_AFTER`].
+fn gpu_thread(mut c: GpuCtx) {
+    let stats = c.stats.clone();
+    let st = &stats.gpus()[c.index];
+    let dev = st.device;
     let mut failures = 0u32;
-    let dev = c.stats.gpus()[c.index].device;
     while !c.stop.load(Ordering::SeqCst) {
-        match gpu_loop(&c) {
+        let mined_before = st.hashes.load(Ordering::Relaxed);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu_loop(&c)))
+            .unwrap_or_else(|p| Err(format!("panicked: {}", panic_text(p.as_ref()))));
+        let e = match r {
             Ok(()) => return,
-            Err(e) => {
-                failures += 1;
-                log!("gpu{dev}: GPU error ({failures}): {e}; retrying");
-                c.stats.gpus()[c.index].set_state(GpuState::Error);
-                let wait = Duration::from_secs(u64::from(failures.min(6)) * 5);
-                let until = Instant::now() + wait;
-                while Instant::now() < until && !c.stop.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(200));
+            Err(e) => e,
+        };
+        if st.hashes.load(Ordering::Relaxed) > mined_before {
+            failures = 0;
+        }
+        failures += 1;
+        st.set_state(GpuState::Error);
+        if failures >= GIVE_UP_AFTER {
+            log!("gpu{dev}: GPU error ({failures} in a row): {e}; giving this GPU up");
+            st.set_state(GpuState::Failed);
+            return;
+        }
+        log!("gpu{dev}: GPU error ({failures}): {e}; retrying");
+        if failures >= RESET_AFTER {
+            // Everything on the old context was dropped with gpu_loop's
+            // state (the DAG built ahead is joined on drop); only this
+            // handle is left.
+            c.gpu = None;
+            match qkm_cuda::reset_device(dev).and_then(|()| Gpu::new(dev)) {
+                Ok(g) => {
+                    log!("gpu{dev}: device reset");
+                    c.gpu = Some(Arc::new(g));
                 }
+                Err(err) => log!("gpu{dev}: device reset failed: {err}"),
             }
+        }
+        let wait = Duration::from_secs(u64::from(failures.min(6)) * 5);
+        let until = Instant::now() + wait;
+        while Instant::now() < until && !c.stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }
 
-/// A next-epoch DAG being built on another thread (`None` when the card
-/// can't hold two DAGs and the switch rebuilds instead).
-type NextDag = Option<std::thread::JoinHandle<Result<Dag, String>>>;
+/// A next-epoch DAG being built on another thread (no build when the card
+/// can't hold two DAGs and the switch rebuilds instead). Dropping it waits
+/// for the build, so a device reset never races one.
+struct NextDag {
+    epoch: u64,
+    build: Option<std::thread::JoinHandle<Result<Dag, String>>>,
+}
 
+impl Drop for NextDag {
+    fn drop(&mut self) {
+        if let Some(h) = self.build.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn gpu_loop(c: &GpuCtx) -> Result<(), String> {
-    let gpu = &c.gpu;
+    let Some(gpu) = &c.gpu else {
+        return Err("the device could not be reopened".into());
+    };
     let st = &c.stats.gpus()[c.index];
     let dev = st.device;
     let e = |e: qkm_cuda::Error| e.to_string();
     let mut kernels = Kernels::shared(gpu, c.cubins.clone());
     let mut searcher = Searcher::new(gpu, c.cfg.geometry).map_err(e)?;
     let mut dag: Option<Dag> = None;
-    let mut next_dag: Option<(u64, NextDag)> = None;
+    let mut next_dag: Option<NextDag> = None;
     let mut light_prefetched: Option<u64> = None;
     let mut rng = Rng::new();
     let mut current: Option<(String, u64)> = None;
     let mut nonce = 0u64;
+    let mut overflow_logged = 0u64;
     loop {
         if c.stop.load(Ordering::SeqCst) {
             return Ok(());
+        }
+        if st.paused.load(Ordering::Relaxed) {
+            st.set_state(GpuState::TooHot);
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
         }
         let Some(w) = c.slot.get(Duration::from_millis(250)) else {
             st.set_state(GpuState::Idle);
@@ -250,12 +334,16 @@ fn gpu_loop(c: &GpuCtx) -> Result<(), String> {
             // The DAG built ahead: wait for it if this is its epoch; any
             // other is dropped (joined first, so two builds never overlap).
             let mut ready = None;
-            if let Some((n, Some(h))) = next_dag.take() {
+            if let Some(mut nd) = next_dag.take()
+                && let Some(h) = nd.build.take()
+            {
                 match h.join() {
-                    Ok(Ok(d)) if n == epoch.number => ready = Some(d),
+                    Ok(Ok(d)) if nd.epoch == epoch.number => ready = Some(d),
                     Ok(Ok(_)) => {}
-                    Ok(Err(err)) => log!("gpu{dev}: epoch {n}: DAG built ahead failed: {err}"),
-                    Err(_) => log!("gpu{dev}: epoch {n}: the DAG prefetch thread panicked"),
+                    Ok(Err(err)) => {
+                        log!("gpu{dev}: epoch {}: DAG built ahead failed: {err}", nd.epoch);
+                    }
+                    Err(_) => log!("gpu{dev}: epoch {}: the DAG prefetch thread panicked", nd.epoch),
                 }
             }
             // Free the old DAG before allocating the next one.
@@ -281,7 +369,7 @@ fn gpu_loop(c: &GpuCtx) -> Result<(), String> {
             let ec = c.verifier.epoch_cache(w.height);
             let cache_s = t.elapsed().as_secs_f64();
             // Then stagger the GPUs from that moment (the first goes at once).
-            let until = Instant::now() + c.cfg.start_stagger * c.index as u32;
+            let until = Instant::now() + c.cfg.start_stagger.saturating_mul(c.index as u32);
             while Instant::now() < until {
                 if c.stop.load(Ordering::SeqCst) {
                     return Ok(());
@@ -318,28 +406,36 @@ fn gpu_loop(c: &GpuCtx) -> Result<(), String> {
         if c.cfg.dag_prefetch && into + 30 >= EPOCH_LENGTH && next_dag.is_none() {
             let next = Epoch::for_height(next_first);
             let (free, _) = gpu.memory().map_err(e)?;
-            if free as u64 > next.dataset_bytes + (512 << 20) {
+            let build = (free as u64 > next.dataset_bytes + (512 << 20)).then(|| {
                 let (g, v) = (gpu.clone(), c.verifier.clone());
                 log!("gpu{dev}: epoch {}: building the next DAG ahead", next.number);
-                let h = std::thread::spawn(move || {
+                std::thread::spawn(move || {
                     let ec = v.epoch_cache(next_first);
                     g.generate_dag(next, &ec.cache).map_err(|e| e.to_string())
-                });
-                next_dag = Some((next.number, Some(h)));
-            } else {
-                // Not enough memory for two DAGs: rebuild at the switch.
-                next_dag = Some((next.number, None));
-            }
+                })
+            });
+            next_dag = Some(NextDag {
+                epoch: next.number,
+                build,
+            });
         }
         let k = kernels.get(gpu, w.height, d.epoch).map_err(e)?;
         st.set_state(GpuState::Mining);
         let (prefix, mask) = nonce_range(w.prefix, w.free_mask, c.index, c.count);
+        // Nonces one round of launches covers past those already counted.
+        let inflight = c.cfg.geometry.batch(k.params.block) * c.cfg.geometry.streams.max(1) as u64;
         let key = (w.job.clone(), w.session);
         if current.as_ref() != Some(&key) {
             current = Some(key);
             // A random start in this GPU's free bits, leaving room to count up.
             nonce = prefix | (rng.next() & (mask >> 1));
         }
+        // Stay inside this GPU's slice: start over at its bottom when the
+        // top is near, and stop each run before reaching it.
+        if mask - (nonce & mask) < 4 * inflight {
+            nonce = prefix;
+        }
+        let room = mask - (nonce & mask);
         let t0 = Instant::now();
         let mut counted = 0u64;
         let generation = w.generation;
@@ -354,23 +450,39 @@ fn gpu_loop(c: &GpuCtx) -> Result<(), String> {
                     st.hashes.fetch_add(done - counted, Ordering::Relaxed);
                     counted = done;
                     !c.stop.load(Ordering::SeqCst)
+                        && !st.paused.load(Ordering::Relaxed)
                         && c.slot.generation() == generation
                         && found.is_empty()
+                        && done + 2 * inflight < room
                         && t0.elapsed() < Duration::from_secs(2)
                 },
             )
             .map_err(e)?;
         nonce = prefix | (nonce.wrapping_add(done) & mask);
+        if searcher.overflow > overflow_logged {
+            log!(
+                "gpu{dev}: {} solutions lost (more than a launch can report): the share difficulty is far too low",
+                searcher.overflow - overflow_logged
+            );
+            overflow_logged = searcher.overflow;
+        }
         for f in found {
-            let _ = c.candidates.send(Candidate {
+            let cand = Candidate {
                 gpu: c.index,
                 work: w.clone(),
                 nonce: f.nonce,
                 mix: f.mix,
-            });
+            };
+            if let Err(TrySendError::Full(_)) = c.candidates.try_send(cand) {
+                c.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
+
+/// Solutions waiting for the CPU check (about 150 a second on one core);
+/// beyond this many they are dropped and counted.
+const CANDIDATE_QUEUE: usize = 256;
 
 /// The submit thread: rsq-pow checks every solution; mismatches are GPU
 /// bugs and are never submitted.
@@ -458,8 +570,10 @@ impl PoolState {
     }
 }
 
-/// Decides whether to follow `job`: same or adjacent epoch at once; a far
-/// epoch only when a second far job confirms it `confirm` later.
+/// Decides whether to follow `job`: the same or the next epoch at once;
+/// any other (an earlier one: a stale template; a far one) only when a
+/// second job from it confirms it `confirm` later. Following a stray job
+/// would cost every GPU two DAG builds.
 fn follow(ps: &mut PoolState, job: Job, confirm: Duration) -> Option<Job> {
     let e = job.height / EPOCH_LENGTH;
     let Some(cur) = ps.epoch else {
@@ -467,7 +581,7 @@ fn follow(ps: &mut PoolState, job: Job, confirm: Duration) -> Option<Job> {
         ps.suspect = None;
         return Some(job);
     };
-    if e.abs_diff(cur) <= 1 {
+    if e == cur || e == cur + 1 {
         ps.epoch = Some(e);
         ps.suspect = None;
         return Some(job);
@@ -482,7 +596,7 @@ fn follow(ps: &mut PoolState, job: Job, confirm: Duration) -> Option<Job> {
         Some((se, ..)) if *se == e => None,
         _ => {
             log!(
-                "job {} at height {} is in epoch {e}, far from epoch {cur}; waiting for a second job before switching",
+                "job {} at height {} is in epoch {e}, not epoch {cur} or the next; waiting for a second job before switching",
                 job.id,
                 job.height
             );
@@ -492,25 +606,78 @@ fn follow(ps: &mut PoolState, job: Job, confirm: Duration) -> Option<Job> {
     }
 }
 
-/// Mines until `stop` is set. The stats are shared with the caller (API).
-pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result<(), String> {
+/// Why mining stopped short.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// A restart will not help (configuration, every pool refused us):
+    /// exit code 2, else 1.
+    pub permanent: bool,
+    /// What happened.
+    pub reason: String,
+}
+
+impl Failure {
+    fn permanent(reason: impl Into<String>) -> Failure {
+        Failure {
+            permanent: true,
+            reason: reason.into(),
+        }
+    }
+
+    fn transient(reason: impl Into<String>) -> Failure {
+        Failure {
+            permanent: false,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// Hashes per KawPoW stratum difficulty unit (difficulty 1 = target
+/// `0x00000000ff…`).
+const HASHES_PER_DIFF: f64 = 1_099_511_627_776.0 / 255.0;
+
+/// Joins `h` within `deadline`; a thread stuck (in a hung CUDA call) is
+/// left behind rather than blocking the exit.
+fn join_by<T>(h: std::thread::JoinHandle<T>, deadline: Instant) -> bool {
+    while !h.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = h.join();
+    true
+}
+
+/// Mines until `stop` is set (`Ok`), or until mining cannot go on (`Err`:
+/// every pool refused authorization, every GPU failed, a GPU stopped
+/// hashing, or the stratum client died). The stats are shared with the
+/// caller (API, TUI).
+#[allow(clippy::too_many_lines)]
+pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result<(), Failure> {
     let listed: Vec<usize> = stats.gpus().iter().map(|g| g.device).collect();
     if listed != cfg.devices {
-        return Err(format!(
+        return Err(Failure::permanent(format!(
             "the stats are for devices {listed:?} but the miner is for {:?}",
             cfg.devices
-        ));
+        )));
     }
     // Settings first, so no GPU hashes before its clocks are set.
     if !cfg.tune.is_empty() {
         apply_tuning(&cfg.devices, &cfg.tune);
     }
     // Open every GPU; one that fails is left out (and shows as idle).
+    let mut opened = Vec::new();
     let mut gpus = Vec::new();
     for (i, &d) in cfg.devices.iter().enumerate() {
         match Gpu::new(d) {
             Ok(gpu) => {
-                let gpu = Arc::new(gpu);
                 if let Ok(bus) = qkm_cuda::pci_bus_id(d) {
                     stats.gpus()[i].set_bus(&bus);
                 }
@@ -519,7 +686,7 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                     gpu.name,
                     gpu.arch.0,
                     gpu.arch.1,
-                    gib(gpu.memory().map_err(|e| e.to_string())?.1 as u64)
+                    gib(gpu.memory().map_or(0, |m| m.1) as u64)
                 );
                 let telemetry = qkm_cuda::pci_bus_id(d)
                     .ok()
@@ -527,16 +694,28 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                 if telemetry.is_none() {
                     log!("gpu{d}: NVML unavailable: no temperature or power readings");
                 }
-                gpus.push((i, gpu, telemetry));
+                gpus.push((i, gpu.name.clone(), telemetry));
+                opened.push((i, Arc::new(gpu)));
             }
             Err(e) => log!("gpu{d}: cannot open: {e}; mining without it"),
         }
     }
-    if gpus.is_empty() {
-        return Err(format!("no usable GPU among devices {:?}", cfg.devices));
+    if opened.is_empty() {
+        return Err(Failure::transient(format!(
+            "no usable GPU among devices {:?}",
+            cfg.devices
+        )));
     }
     if let Some(p) = cfg.pools.first() {
         stats.set_worker(&p.user);
+        if let Ok(pay) = crate::quai::parse_payout(&p.user) {
+            let lock = p
+                .pass
+                .split([',', '_'])
+                .find_map(|o| o.strip_prefix("lock="))
+                .unwrap_or("0");
+            stats.set_payout(&format!("{} · {} · lock {lock}", pay.ledger, pay.zone()));
+        }
     }
     for (i, p) in cfg.pools.iter().enumerate() {
         log!(
@@ -546,11 +725,17 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
             redact(&p.pass)
         );
     }
+    if let Some(l) = cfg.temp_limit {
+        log!(
+            "temperature limit {l}C: a GPU that reaches it pauses until it cools to {}C",
+            cfg.temp_resume()
+        );
+    }
     let verifier = Arc::new(Verifier::default());
     let slot = Arc::new(Slot::default());
     let (ev_tx, ev_rx) = channel();
     let client = Client::start(Config::new(cfg.pools.clone()), ev_tx);
-    let (cand_tx, cand_rx) = channel();
+    let (cand_tx, cand_rx) = sync_channel(CANDIDATE_QUEUE);
     let seq = Arc::new(AtomicU64::new(0));
     let submitter = {
         let (v, s, st, q) = (
@@ -562,15 +747,16 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
         std::thread::Builder::new()
             .name("submit".into())
             .spawn(move || submit_thread(cand_rx, v, s, st, q))
-            .map_err(|e| e.to_string())?
+            .map_err(|e| Failure::transient(e.to_string()))?
     };
+    let hashrate_reporter = client.submitter();
     let cubins = Arc::new(Cubins::new(cfg.search));
     let mut gpu_handles = Vec::new();
-    for (i, gpu, _) in &gpus {
+    for (i, gpu) in opened {
         let ctx = GpuCtx {
-            index: *i,
+            index: i,
             count: cfg.devices.len(),
-            gpu: gpu.clone(),
+            gpu: Some(gpu),
             cubins: cubins.clone(),
             slot: slot.clone(),
             stats: stats.clone(),
@@ -581,9 +767,9 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
         };
         gpu_handles.push(
             std::thread::Builder::new()
-                .name(format!("gpu{}", cfg.devices[*i]))
+                .name(format!("gpu{}", cfg.devices[i]))
                 .spawn(move || gpu_thread(ctx))
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| Failure::transient(e.to_string()))?,
         );
     }
     // The submit thread ends when the last GPU thread drops its sender.
@@ -591,20 +777,105 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
     let mut ps = PoolState::new();
     let mut last_status = Instant::now();
     let mut last_sample = Instant::now() - Duration::from_secs(10);
+    let mut last_report = Instant::now();
+    let mut dropped_logged = 0u64;
+    // Per GPU: the hash count last seen and since when it has not moved.
+    let mut progress: Vec<(u64, Instant)> = vec![(0, Instant::now()); stats.gpus().len()];
+    // The epoch whose seed hash was last computed, and the seed.
+    let mut seed: Option<(u64, [u8; 32])> = None;
+    // The difficulty the share-rate warnings were last checked for.
+    let mut warned_for: Option<f64> = None;
+    let mining_since = Instant::now();
+    let mut fail: Option<Failure> = None;
     while !stop.load(Ordering::SeqCst) {
         if last_sample.elapsed() >= Duration::from_secs(5) {
             last_sample = Instant::now();
             stats.sample();
-            for (i, gpu, t) in &gpus {
+            for (i, name, t) in &gpus {
+                let g = &stats.gpus()[*i];
                 let r = t.as_ref().map(Telemetry::read).unwrap_or_default();
-                stats.gpus()[*i].set_reading(&gpu.name, r);
+                // Thermal limit, with hysteresis.
+                if let (Some(limit), Some(temp)) = (cfg.temp_limit, r.temperature_c) {
+                    let paused = g.paused.load(Ordering::Relaxed);
+                    if !paused && temp >= limit {
+                        g.paused.store(true, Ordering::Relaxed);
+                        log!(
+                            "gpu{}: {temp}C reached the {limit}C limit; paused until {}C",
+                            g.device,
+                            cfg.temp_resume()
+                        );
+                    } else if paused && temp <= cfg.temp_resume() {
+                        g.paused.store(false, Ordering::Relaxed);
+                        log!("gpu{}: cooled to {temp}C; mining again", g.device);
+                    }
+                }
+                g.set_reading(name, r);
             }
+            // A GPU that says it mines but whose count does not move is
+            // stuck in a kernel or the driver; only a new process helps.
+            for (k, g) in stats.gpus().iter().enumerate() {
+                let h = g.hashes.load(Ordering::Relaxed);
+                if h != progress[k].0 || g.state() != GpuState::Mining {
+                    progress[k] = (h, Instant::now());
+                } else if progress[k].1.elapsed() >= cfg.stall_timeout {
+                    fail = Some(Failure::transient(format!(
+                        "gpu{} stopped hashing {} s ago (a hung kernel or driver)",
+                        g.device,
+                        progress[k].1.elapsed().as_secs()
+                    )));
+                }
+            }
+            if gpu_handles.iter().all(std::thread::JoinHandle::is_finished) {
+                fail = Some(Failure::transient("every GPU failed"));
+            }
+            if fail.is_some() {
+                break;
+            }
+            let dropped = stats.dropped.load(Ordering::Relaxed);
+            if dropped > dropped_logged {
+                log!(
+                    "{} GPU solutions dropped: the CPU check cannot keep up; raise the share difficulty (d=)",
+                    dropped - dropped_logged
+                );
+                dropped_logged = dropped;
+            }
+            // Share-rate sanity, once the hashrate is known.
+            let rate = stats.hashrate(Duration::from_secs(60));
+            let diff = ps.target.map(|t| difficulty_of_target(&t));
+            if let Some(d) = diff
+                && mining_since.elapsed() >= Duration::from_secs(120)
+                && rate > 0.0
+                && warned_for != Some(d)
+            {
+                warned_for = Some(d);
+                let per_share = d * HASHES_PER_DIFF / rate;
+                if per_share > 300.0 {
+                    log!(
+                        "difficulty {d}: one share every {:.0} min at {:.1} MH/s; Quai nodes close a connection after 10 min without a share. Lower d=",
+                        per_share / 60.0,
+                        rate / 1e6
+                    );
+                } else if per_share < 0.05 {
+                    log!(
+                        "difficulty {d}: {:.0} shares a second at {:.1} MH/s; the CPU check may fall behind. Raise d=",
+                        1.0 / per_share,
+                        rate / 1e6
+                    );
+                }
+            }
+        }
+        if cfg.report_hashrate
+            && last_report.elapsed() >= Duration::from_secs(60)
+            && ps.authorized
+        {
+            last_report = Instant::now();
+            hashrate_reporter.report_hashrate(stats.hashrate(Duration::from_secs(60)));
         }
         if last_status.elapsed() >= cfg.status_every {
             last_status = Instant::now();
             print_status(&stats);
         }
-        // A far-epoch job nobody contradicted for long enough.
+        // A suspect job nobody contradicted for long enough.
         if ps
             .suspect
             .as_ref()
@@ -620,7 +891,10 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
         let ev = match ev_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(ev) => ev,
             Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                fail = Some(Failure::transient("the stratum client stopped unexpectedly"));
+                break;
+            }
         };
         match ev {
             Event::Connected { url, session, .. } => {
@@ -629,10 +903,22 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                 ps.session = session;
                 ps.authorized = false;
                 ps.job = None;
+                // Each pool sends its own target.
+                ps.target = None;
+                ps.prefix = 0;
+                ps.free_mask = u64::MAX;
                 slot.set(None);
             }
             Event::Extranonce(x) => {
-                let n = x.len().min(4);
+                // Up to 6 bytes (16 free bits are plenty); Quai's 1-byte
+                // session id is harmless as a prefix.
+                if x.len() > 6 {
+                    log!(
+                        "the pool's extranonce is {} bytes; at most 6 are supported, so it is ignored (shares may be refused)",
+                        x.len()
+                    );
+                }
+                let n = if x.len() > 6 { 0 } else { x.len() };
                 let mut p = 0u64;
                 for b in &x[..n] {
                     p = (p << 8) | u64::from(*b);
@@ -644,6 +930,7 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                 } else {
                     u64::MAX >> bits
                 };
+                slot.set(ps.work());
             }
             Event::Authorized => {
                 log!("authorized");
@@ -662,9 +949,13 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                 slot.set(ps.work());
             }
             Event::Job(job) => {
+                // The parser caps heights, so this stays cheap; computed once
+                // per epoch.
                 let e = job.height / EPOCH_LENGTH;
-                let want = PARAMS.seed_hash(e * EPOCH_LENGTH + 1);
-                if job.seed != want {
+                if seed.is_none_or(|(se, _)| se != e) {
+                    seed = Some((e, PARAMS.seed_hash(e * EPOCH_LENGTH + 1)));
+                }
+                if seed.is_some_and(|(_, want)| job.seed != want) {
                     log!("job {}: the seed hash does not match epoch {e}", job.id);
                 }
                 if let Some(job) = follow(&mut ps, job, cfg.far_epoch_confirm) {
@@ -703,17 +994,32 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                 ps.job = None;
                 slot.set(None);
             }
+            Event::Fatal(why) => {
+                fail = Some(Failure::permanent(why));
+                break;
+            }
         }
     }
-    log!("stopping");
+    match &fail {
+        Some(why) => log!("stopping: {why}"),
+        None => log!("stopping"),
+    }
+    stop.store(true, Ordering::SeqCst);
     client.stop();
     slot.set(None);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stuck = 0;
     for h in gpu_handles {
-        let _ = h.join();
+        if !join_by(h, deadline) {
+            stuck += 1;
+        }
     }
-    let _ = submitter.join();
+    if stuck > 0 {
+        log!("{stuck} GPU thread(s) did not stop (hung in the driver); exiting anyway");
+    }
+    let _ = join_by(submitter, deadline);
     print_status(&stats);
-    Ok(())
+    fail.map_or(Ok(()), Err)
 }
 
 /// The status line, then one line per GPU when there are several (stdout
@@ -837,6 +1143,9 @@ mod tests {
         assert!(follow(&mut ps, job(4_206_443), c).is_none());
         // Back to normal clears it.
         assert!(follow(&mut ps, job(4_567_601), c).is_some());
+        // One stale job from the previous epoch is ignored too.
+        assert!(follow(&mut ps, job(4_567_000), c).is_none());
+        assert!(follow(&mut ps, job(4_567_602), c).is_some());
         assert!(ps.suspect.is_none());
         // Confirmed after the delay.
         assert!(follow(&mut ps, job(100), c).is_none());

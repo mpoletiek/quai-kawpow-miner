@@ -64,6 +64,9 @@ impl Tuning {
         if self.fan.is_some_and(|f| f > 100) {
             return Err("fan speed above 100%".into());
         }
+        if self.power_limit.is_some_and(|w| w == 0 || w > 1000) {
+            return Err("power limit: 1 to 1000 W".into());
+        }
         Ok(())
     }
 }

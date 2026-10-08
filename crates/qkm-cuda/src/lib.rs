@@ -61,6 +61,39 @@ impl Header {
     }
 }
 
+/// Checks that the CUDA driver (`libcuda`) and NVRTC (`libnvrtc`) can be
+/// loaded. cudarc panics on first use when one is missing, so call this
+/// first and report the error instead.
+pub fn libraries() -> Result<()> {
+    // SAFETY: only tries to dlopen the libraries by their usual names.
+    let (cuda, nvrtc) = unsafe {
+        (
+            cudarc::driver::sys::is_culib_present(),
+            cudarc::nvrtc::sys::is_culib_present(),
+        )
+    };
+    match (cuda, nvrtc) {
+        (true, true) => Ok(()),
+        (false, _) => Err(Error(
+            "the NVIDIA driver library (libcuda.so.1) is not installed or not on the library path".into(),
+        )),
+        (true, false) => Err(Error(
+            "NVRTC (libnvrtc.so) is not installed or not on the library path: install the CUDA runtime compiler package (e.g. cuda-nvrtc-13-x) or set LD_LIBRARY_PATH to the CUDA toolkit's lib64".into(),
+        )),
+    }
+}
+
+/// Resets device `ordinal`'s primary context: frees everything on it and
+/// clears a sticky error (an illegal address or ECC fault ruins a context
+/// for good). Every handle into the old context must be dropped first.
+pub fn reset_device(ordinal: usize) -> Result<()> {
+    cudarc::driver::result::init()?;
+    let dev = cudarc::driver::result::device::get(ordinal as i32)?;
+    // SAFETY: a valid device handle; the caller dropped its contexts' users.
+    unsafe { cudarc::driver::sys::cuDevicePrimaryCtxReset_v2(dev).result()? };
+    Ok(())
+}
+
 /// The number of CUDA devices.
 pub fn device_count() -> Result<usize> {
     cudarc::driver::result::init()?;
@@ -475,6 +508,9 @@ pub struct Searcher {
     streams: Vec<Arc<CudaStream>>,
     outs: Vec<CudaSlice<u32>>,
     geom: Geometry,
+    /// Solutions launches found beyond the `MAX_RESULTS` they can report
+    /// (lost; only an absurdly easy target gets there).
+    pub overflow: u64,
 }
 
 impl Searcher {
@@ -491,6 +527,7 @@ impl Searcher {
             streams,
             outs,
             geom,
+            overflow: 0,
         })
     }
 
@@ -523,8 +560,9 @@ impl Searcher {
         Ok(())
     }
 
-    fn collect(&self, i: usize, start: u64, found: &mut Vec<Found>) -> Result<()> {
+    fn collect(&mut self, i: usize, start: u64, found: &mut Vec<Found>) -> Result<()> {
         let out = self.streams[i].clone_dtoh(&self.outs[i])?;
+        self.overflow += u64::from(out[0].saturating_sub(MAX_RESULTS));
         let n = out[0].min(MAX_RESULTS) as usize;
         for r in 0..n {
             let o = 1 + r * 9;

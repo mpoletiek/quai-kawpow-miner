@@ -1,0 +1,56 @@
+# quai-kawpow-miner configuration (flags on the command line win).
+
+# GPUs to mine on (CUDA indexes, see `quai-kawpow-miner devices`); default: all.
+#devices = [0, 1, 2]
+
+# HTTP API: JSON on /, Prometheus on /metrics, ok on /health. Keep it on
+# localhost unless you mean to share it.
+api = "127.0.0.1:4073"
+
+# Log and status lines; rotates at 50 MiB, three old files kept.
+#log_file = "/var/log/quai-kawpow-miner/miner.log"
+status_secs = 60
+
+# Coinbase lockup: 0 = the node's default (normally 2 weeks), 1 = 3 months,
+# 2 = 6 months, 3 = 1 year. Longer lockups earn a reward bonus.
+lock = 0
+
+# Pause a GPU at this temperature (C) until it cools to temp_resume
+# (default 15 below). 0 turns it off.
+temp_limit = 90
+#temp_resume = 75
+
+# Seconds between one GPU's DAG build and the next's.
+start_stagger = 5
+
+# Send the hashrate to the pool every minute (eth_submitHashrate).
+report_hashrate = false
+
+# GPU settings, applied by `sudo quai-kawpow-miner tune --config <this file>`
+# (and by `mine` when it runs as root).
+[tune]
+#power_limit = 200            # W
+#lock_core_clocks = [1400, 1800]
+#lock_mem_clocks = [5000, 9251]
+#core_offset = 0              # MHz
+#mem_offset = 0               # MHz
+#fan = 70                     # % (turns automatic fan control off)
+
+# One GPU's own settings.
+#[tune.gpu.0]
+#power_limit = 150
+
+# Pools, in order of preference. The user is the payout address (a Quai
+# address pays in Quai, a Qi address in Qi) and a worker name.
+[[pool]]
+url = "stratum+tcp://127.0.0.1:3333"
+user = "0xYOUR_ADDRESS.rig1"
+# d = fixed share difficulty (aim for a share every ~30 s: d=1 for ~150 MH/s)
+pass = "d=1"
+# rs-quai's stratum token, if the node requires one (sent as auth=).
+#auth_token_file = "/etc/quai-kawpow-miner/stratum-token"
+
+#[[pool]]                     # a backup
+#url = "stratum+tcp://10.0.0.12:3333"
+#user = "0xYOUR_ADDRESS.rig1"
+#pass = "d=1"

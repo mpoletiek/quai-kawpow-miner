@@ -194,8 +194,11 @@ fn uptime(d: Duration) -> String {
 /// `0x00b9A4…135f.octo0`: the address shortened, the worker name kept.
 fn short_worker(w: &str) -> String {
     let (addr, name) = w.split_once('.').unwrap_or((w, ""));
-    let addr = if addr.len() > 14 {
-        format!("{}…{}", &addr[..8], &addr[addr.len() - 4..])
+    let chars: Vec<char> = addr.chars().collect();
+    let addr = if chars.len() > 14 {
+        let head: String = chars[..8].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{head}…{tail}")
     } else {
         addr.to_string()
     };
@@ -222,6 +225,8 @@ fn state_cell(g: &GpuView, connected: bool) -> Cell<'static> {
         GpuState::Mining => Cell::from("mining").fg(Color::Green),
         GpuState::BuildingDag(e) => Cell::from(format!("DAG {e}")).fg(Color::Yellow),
         GpuState::Error => Cell::from("error").red().bold(),
+        GpuState::Failed => Cell::from("failed").red().bold(),
+        GpuState::TooHot => Cell::from("too hot").red().bold(),
         GpuState::Idle if connected => Cell::from("idle").fg(Color::Red),
         GpuState::Idle => Cell::from("idle").fg(Color::DarkGray),
     }
@@ -264,13 +269,21 @@ fn draw_header(f: &mut Frame, area: Rect, v: &View) {
     };
     let wide = area.width >= 100;
     let sep = if wide { "  │  " } else { " │ " };
-    let mut spans = vec![Span::raw(" quai-kawpow-miner ").bold()];
+    let mut spans = vec![Span::raw(if wide { " quai-kawpow-miner " } else { " qkm" }).bold()];
     if wide {
         spans.push(Span::raw(env!("CARGO_PKG_VERSION")).fg(Color::Gray));
     }
+    // Narrow: the worker name alone (the address is in the log).
+    let who = if wide {
+        short_worker(&v.worker)
+    } else {
+        v.worker.split_once('.').map_or_else(|| short_worker(&v.worker), |(_, w)| w.to_string())
+    };
+    spans.extend([Span::raw(sep), Span::raw(who).bold()]);
+    if !v.payout.is_empty() {
+        spans.push(Span::raw(format!(" ({})", v.payout)).fg(Color::Yellow));
+    }
     spans.extend([
-        Span::raw(sep),
-        Span::raw(short_worker(&v.worker)).bold(),
         Span::raw(sep),
         Span::raw(format!("{dot} ")).fg(if v.connected { Color::Green } else { Color::Red }),
         pool,
@@ -624,6 +637,7 @@ mod tests {
             connected: true,
             pool: "10.0.0.13:3333".into(),
             worker: "0x00b9A46D00f00aE0b4e21b07db6AB3864b4B135f.octo0".into(),
+            payout: "Qi · cyprus1 · lock 2".into(),
             job: Some(("j1".into(), 4_572_712)),
             difficulty: 1.0,
             rate_1m: 145.6e6,
@@ -684,6 +698,7 @@ mod tests {
         }
         for want in [
             "145.60 MH/s", "A 34", "h4572712", "epoch 609", "0x00b9A4…135f.octo0",
+            "Qi · cyprus1 · lock 2",
             "RTX 3060 Ti", "150/150W", "9251", "P2", "power cap", "all", "1049 W",
             "share 34 from gpu3", "Log",
         ] {
@@ -712,5 +727,7 @@ mod tests {
         assert_eq!(age(Duration::from_secs(245)), "4m05s");
         assert_eq!(age(Duration::from_secs(7980)), "2h13m");
         assert_eq!(short_worker("0xabc.rig"), "0xabc.rig");
+        // Not ASCII (once a panic).
+        assert_eq!(short_worker("ééééééééééééééééé.r"), "éééééééé…éééé.r");
     }
 }

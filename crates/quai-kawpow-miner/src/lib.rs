@@ -4,6 +4,7 @@
 pub mod api;
 pub mod miner;
 pub mod output;
+pub mod quai;
 pub mod stats;
 pub mod telemetry;
 pub mod tui;

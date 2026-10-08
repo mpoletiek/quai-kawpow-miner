@@ -12,6 +12,17 @@ use rsq_pow::{EpochCache, EpochCaches};
 /// Blocks per epoch.
 pub const EPOCH_LENGTH: u64 = 7500;
 
+/// The last epoch this miner accepts work for: its DAG is about 33 GiB,
+/// decades away (epoch 609 in October 2026). A height past it comes from a
+/// broken or hostile pool, and computing its seed or light cache would take
+/// minutes to years.
+pub const MAX_EPOCH: u64 = 4096;
+
+/// Whether a donor height is one this miner can mine.
+pub fn plausible_height(height: u64) -> bool {
+    height / EPOCH_LENGTH <= MAX_EPOCH
+}
+
 /// The ProgPoW period of a height.
 pub fn period(height: u64) -> u64 {
     height / PERIOD_LENGTH

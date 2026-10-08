@@ -2,11 +2,15 @@
 //! fails over across pools, and reports everything as [`Event`]s.
 //!
 //! Nothing the server does can crash it: bad lines are logged and skipped,
-//! a closed or silent connection is replaced, and a pool that keeps failing
-//! hands over to the next one.
+//! over-long lines end the connection, a closed or silent connection (or an
+//! unanswered subscribe or authorize) is replaced, and a pool that keeps
+//! failing hands over to the next one. After [`Config::primary_retry`] on a
+//! backup, the first pool is probed every minute and taken back once it
+//! answers. When every pool has refused authorization (a wrong address,
+//! lock or token: nothing a retry fixes), [`Event::Fatal`] ends the client.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
@@ -15,9 +19,13 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::proto::{
-    Job, Message, error_text, parse_line, redact, request, submit_params, subscribe_extranonce,
-    target_for_difficulty,
+    Job, MAX_LOGGED, Message, error_text, parse_line, redact, request, sanitize, submit_params,
+    subscribe_extranonce, target_for_difficulty,
 };
+
+/// Longest line accepted from a pool (Quai's are well under 1 KiB); a
+/// longer one ends the connection.
+pub const MAX_LINE: usize = 64 * 1024;
 
 /// One pool.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,9 +68,11 @@ pub struct Config {
     pub work_timeout: Duration,
     /// Consecutive failures on one pool before trying the next.
     pub failures_before_failover: u32,
-    /// After this long on a backup pool, the next reconnect tries the
-    /// first pool again.
+    /// After this long on a backup pool, the first pool is probed (every
+    /// [`Config::probe_every`]) and taken back once it accepts a connection.
     pub primary_retry: Duration,
+    /// How often a backup session probes the first pool.
+    pub probe_every: Duration,
     /// Longest wait between reconnect attempts.
     pub max_backoff: Duration,
 }
@@ -78,6 +88,7 @@ impl Config {
             work_timeout: Duration::from_secs(180),
             failures_before_failover: 2,
             primary_retry: Duration::from_secs(600),
+            probe_every: Duration::from_secs(60),
             max_backoff: Duration::from_secs(30),
         }
     }
@@ -141,19 +152,25 @@ pub enum Event {
     },
     /// Something worth logging (e.g. a line from the pool that was skipped).
     Notice(String),
+    /// Every pool refused authorization; the client has stopped.
+    Fatal(String),
 }
 
 enum Cmd {
     Submit(Share),
+    Hashrate(f64),
     Line(u64, String),
     Closed(u64, String),
+    PrimaryUp(u64),
     Stop,
 }
 
 enum Pending {
-    Subscribe,
-    Authorize,
+    Subscribe { sent: Instant },
+    Authorize { sent: Instant },
     Submit { seq: u64, sent: Instant },
+    /// A request whose answer does not matter (`eth_submitHashrate`).
+    Other,
 }
 
 /// Submits shares to a running [`Client`] from another thread.
@@ -166,6 +183,12 @@ impl Submitter {
     /// Queues a share for submission.
     pub fn submit(&self, share: Share) {
         let _ = self.tx.send(Cmd::Submit(share));
+    }
+
+    /// Reports the miner's hashrate (hashes per second) to the pool with
+    /// `eth_submitHashrate` (pools display it; Quai nodes only log it).
+    pub fn report_hashrate(&self, hashes_per_second: f64) {
+        let _ = self.tx.send(Cmd::Hashrate(hashes_per_second));
     }
 }
 
@@ -274,15 +297,68 @@ fn wait(rx: &Receiver<Cmd>, d: Duration, events: &Sender<Event>) -> bool {
 enum End {
     Stop,
     Reconnect(String),
-    AuthFailed,
+    AuthFailed(String),
+    /// The first pool answers again: go back to it.
+    Primary,
 }
 
-#[allow(clippy::too_many_lines)]
+/// What [`session`] needs to know about failing back to the first pool.
+struct Probe {
+    /// The first pool's `host:port`.
+    url: String,
+    /// When to start probing it.
+    from: Instant,
+}
+
+/// Reads lines of at most [`MAX_LINE`] bytes from the pool into `tx`.
+fn read_lines(read_half: TcpStream, session_id: u64, tx: &Sender<Cmd>) {
+    let mut r = BufReader::new(read_half);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match (&mut r).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf) {
+            Ok(0) => {
+                let _ = tx.send(Cmd::Closed(session_id, "closed by the pool".into()));
+                return;
+            }
+            Ok(_) if buf.len() > MAX_LINE && buf.last() != Some(&b'\n') => {
+                let _ = tx.send(Cmd::Closed(
+                    session_id,
+                    format!("the pool sent a line longer than {} KiB", MAX_LINE / 1024),
+                ));
+                return;
+            }
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf).trim().to_string();
+                if tx.send(Cmd::Line(session_id, line)).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Cmd::Closed(session_id, format!("read: {e}")));
+                return;
+            }
+        }
+    }
+}
+
+/// `eth_submitHashrate`'s client id: 32 bytes, fixed for the process.
+fn hashrate_id() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    let s = RandomState::new();
+    let words: Vec<String> = (0..4u8)
+        .map(|i| format!("{:016x}", s.hash_one((i, std::process::id()))))
+        .collect();
+    format!("0x{}", words.concat())
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn session(
     cfg: &Config,
     pool: &Pool,
     stream: TcpStream,
     session_id: u64,
+    probe: Option<Probe>,
     rx: &Receiver<Cmd>,
     tx: &Sender<Cmd>,
     events: &Sender<Event>,
@@ -296,31 +372,7 @@ fn session(
     let tx_r = tx.clone();
     let _ = std::thread::Builder::new()
         .name("stratum-read".into())
-        .spawn(move || {
-            let mut r = BufReader::new(read_half);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match r.read_line(&mut line) {
-                    Ok(0) => {
-                        let _ = tx_r.send(Cmd::Closed(session_id, "closed by the pool".into()));
-                        return;
-                    }
-                    Ok(_) => {
-                        if tx_r
-                            .send(Cmd::Line(session_id, line.trim().to_string()))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx_r.send(Cmd::Closed(session_id, format!("read: {e}")));
-                        return;
-                    }
-                }
-            }
-        });
+        .spawn(move || read_lines(read_half, session_id, &tx_r));
     let mut out = stream;
     let mut next_id = 1u64;
     let mut pending: HashMap<u64, Pending> = HashMap::new();
@@ -330,7 +382,9 @@ fn session(
         &mut pending,
         "mining.subscribe",
         json!([cfg.agent]),
-        Pending::Subscribe,
+        Pending::Subscribe {
+            sent: Instant::now(),
+        },
     ) {
         return End::Reconnect(e);
     }
@@ -340,16 +394,48 @@ fn session(
         &mut pending,
         "mining.authorize",
         json!([pool.user, pool.pass]),
-        Pending::Authorize,
+        Pending::Authorize {
+            sent: Instant::now(),
+        },
     ) {
         return End::Reconnect(e);
     }
     let mut authorized = false;
     let mut last_work = Instant::now();
     let mut no_response = 0u32;
+    let mut last_probe: Option<Instant> = None;
+    let hr_id = hashrate_id();
     let end = loop {
         // Unanswered requests.
         let now = Instant::now();
+        let handshake_late = pending.values().find_map(|p| match p {
+            Pending::Subscribe { sent } if now.duration_since(*sent) > cfg.response_timeout => {
+                Some("mining.subscribe")
+            }
+            Pending::Authorize { sent } if now.duration_since(*sent) > cfg.response_timeout => {
+                Some("mining.authorize")
+            }
+            _ => None,
+        });
+        if let Some(m) = handshake_late {
+            break End::Reconnect(format!("no answer to {m}"));
+        }
+        // On a backup: probe the first pool now and then.
+        if let Some(p) = &probe
+            && now >= p.from
+            && last_probe.is_none_or(|t| now.duration_since(t) >= cfg.probe_every)
+        {
+            last_probe = Some(now);
+            let (url, timeout, tx_p) = (p.url.clone(), cfg.connect_timeout, tx.clone());
+            let _ = std::thread::Builder::new()
+                .name("stratum-probe".into())
+                .spawn(move || {
+                    if let Ok(s) = connect(&url, timeout) {
+                        let _ = s.shutdown(Shutdown::Both);
+                        let _ = tx_p.send(Cmd::PrimaryUp(session_id));
+                    }
+                });
+        }
         let late: Vec<u64> = pending
             .iter()
             .filter_map(|(id, p)| match p {
@@ -385,6 +471,23 @@ fn session(
         };
         match cmd {
             Cmd::Stop => break End::Stop,
+            Cmd::PrimaryUp(id) if id == session_id => break End::Primary,
+            Cmd::PrimaryUp(_) => {}
+            Cmd::Hashrate(h) => {
+                if authorized && h.is_finite() && h >= 0.0 {
+                    let rate = format!("0x{:x}", h as u64);
+                    if let Err(e) = send(
+                        &mut out,
+                        &mut next_id,
+                        &mut pending,
+                        "eth_submitHashrate",
+                        json!([rate, hr_id]),
+                        Pending::Other,
+                    ) {
+                        break End::Reconnect(e);
+                    }
+                }
+            }
             Cmd::Closed(id, reason) if id == session_id => break End::Reconnect(reason),
             Cmd::Closed(..) => {}
             Cmd::Line(id, _) if id != session_id => {}
@@ -397,26 +500,26 @@ fn session(
                     Err(e) => {
                         let _ = events.send(Event::Notice(format!(
                             "stratum: skipping a line ({e}): {}",
-                            redact(&line)
+                            sanitize(&redact(&line), MAX_LOGGED)
                         )));
                         continue;
                     }
                 };
                 match msg {
                     Message::Response { id, result, error } => match pending.remove(&id) {
-                        Some(Pending::Subscribe) => {
+                        Some(Pending::Subscribe { .. }) => {
                             let x = subscribe_extranonce(&result);
                             let _ = events.send(Event::Extranonce(x));
                         }
-                        Some(Pending::Authorize) => {
+                        Some(Pending::Authorize { .. }) => {
                             if result == Value::Bool(true) {
                                 authorized = true;
                                 let _ = events.send(Event::Authorized);
                             } else {
                                 let why =
                                     error_text(&error).unwrap_or_else(|| "refused".to_string());
-                                let _ = events.send(Event::AuthFailed(why));
-                                break End::AuthFailed;
+                                let _ = events.send(Event::AuthFailed(why.clone()));
+                                break End::AuthFailed(why);
                             }
                         }
                         Some(Pending::Submit { seq, sent }) => {
@@ -433,7 +536,7 @@ fn session(
                                 latency: sent.elapsed(),
                             });
                         }
-                        None => {}
+                        Some(Pending::Other) | None => {}
                     },
                     Message::Notify(job) => {
                         last_work = Instant::now();
@@ -524,11 +627,9 @@ fn run(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Cmd>, events: Sender<Event>) {
     let mut backoff = Duration::from_secs(1);
     let mut session_id = 0u64;
     let mut on_backup_since: Option<Instant> = None;
+    // Pools that refused authorization (and why).
+    let mut refused: Vec<Option<String>> = vec![None; cfg.pools.len()];
     loop {
-        if idx != 0 && on_backup_since.is_some_and(|t| t.elapsed() > cfg.primary_retry) {
-            idx = 0;
-            on_backup_since = None;
-        }
         let pool = &cfg.pools[idx];
         let url = pool.host_port().to_string();
         let outcome = match connect(&url, cfg.connect_timeout) {
@@ -541,7 +642,11 @@ fn run(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Cmd>, events: Sender<Event>) {
                     session: session_id,
                 });
                 let started = Instant::now();
-                let end = session(&cfg, pool, stream, session_id, &rx, &tx, &events);
+                let probe = on_backup_since.map(|t| Probe {
+                    url: cfg.pools[0].host_port().to_string(),
+                    from: t + cfg.primary_retry,
+                });
+                let end = session(&cfg, pool, stream, session_id, probe, &rx, &tx, &events);
                 Ok((end, started.elapsed()))
             }
         };
@@ -553,12 +658,42 @@ fn run(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Cmd>, events: Sender<Event>) {
                 });
                 return;
             }
-            Ok((End::Reconnect(r), lasted)) => (r, lasted > Duration::from_secs(60), false),
-            Ok((End::AuthFailed, _)) => ("authorization refused".into(), false, true),
+            Ok((End::Primary, _)) => {
+                let _ = events.send(Event::Disconnected {
+                    reason: format!("{url}: the first pool answers again; going back to it"),
+                });
+                idx = 0;
+                on_backup_since = None;
+                failures = 0;
+                backoff = Duration::from_secs(1);
+                continue;
+            }
+            Ok((End::Reconnect(r), lasted)) => {
+                // A session that got going clears an old refusal.
+                refused[idx] = None;
+                (r, lasted > Duration::from_secs(60), false)
+            }
+            Ok((End::AuthFailed(why), _)) => {
+                refused[idx] = Some(why.clone());
+                (format!("authorization refused: {why}"), false, true)
+            }
         };
         let _ = events.send(Event::Disconnected {
             reason: format!("{url}: {reason}"),
         });
+        if refused.iter().all(Option::is_some) {
+            let why: Vec<String> = cfg
+                .pools
+                .iter()
+                .zip(&refused)
+                .map(|(p, r)| format!("{}: {}", p.host_port(), r.as_deref().unwrap_or("")))
+                .collect();
+            let _ = events.send(Event::Fatal(format!(
+                "every pool refused authorization ({}); check the address, lock and auth token",
+                why.join("; ")
+            )));
+            return;
+        }
         if healthy {
             failures = 0;
             backoff = Duration::from_secs(1);

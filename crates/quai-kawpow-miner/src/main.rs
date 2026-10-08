@@ -108,6 +108,20 @@ enum Cmd {
         /// GPUs don't change load all at once.
         #[arg(long, value_name = "SECS")]
         start_stagger: Option<f64>,
+        /// Coinbase lockup (sent as `lock=`): 0 = the node's default
+        /// (normally 2 weeks), 1 = 3 months, 2 = 6 months, 3 = 1 year; longer
+        /// lockups earn a reward bonus.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=3))]
+        lock: Option<u8>,
+        /// Pause a GPU at this temperature, Celsius (default 90; 0 = off).
+        #[arg(long, value_name = "C")]
+        temp_limit: Option<u32>,
+        /// Resume a paused GPU at this temperature (default: limit - 15).
+        #[arg(long, value_name = "C")]
+        temp_resume: Option<u32>,
+        /// Report the hashrate to the pool every minute (eth_submitHashrate).
+        #[arg(long)]
+        report_hashrate: bool,
         /// Print log lines instead of the full-screen view (the default when
         /// stdout is not a terminal).
         #[arg(long)]
@@ -118,6 +132,8 @@ enum Cmd {
         #[command(flatten)]
         tune: TuneArgs,
     },
+    /// List the CUDA devices (index, PCI bus, name, memory, power limit).
+    Devices,
     /// Apply GPU settings (power limit, clocks, fans) and exit; needs root.
     /// Takes the same settings as `mine` (flags or the config's `[tune]`).
     Tune {
@@ -592,6 +608,10 @@ struct FileConfig {
     start_stagger: Option<f64>,
     tui: Option<bool>,
     log_file: Option<std::path::PathBuf>,
+    lock: Option<u8>,
+    temp_limit: Option<u32>,
+    temp_resume: Option<u32>,
+    report_hashrate: Option<bool>,
     #[serde(default)]
     tune: TuneConfig,
     #[serde(default, rename = "pool")]
@@ -608,22 +628,55 @@ struct FilePool {
     auth_token_file: Option<std::path::PathBuf>,
 }
 
-/// `auth=<token>` from a file, put in front of the other options.
-fn password(pass: &str, token_file: Option<&std::path::Path>) -> Result<String, String> {
-    let Some(f) = token_file else {
-        return Ok(pass.to_string());
+/// One pool's stratum login, checked: the payout address and worker, and
+/// the password (`auth=<token>` from the token file first, the options,
+/// then `lock=`). Returns the pool and what is worth telling the user.
+fn login(
+    url: &str,
+    user: &str,
+    pass: &str,
+    token_file: Option<&std::path::Path>,
+    lock: Option<u8>,
+) -> Result<(qkm_stratum::Pool, Vec<String>), String> {
+    use quai_kawpow_miner::quai;
+    let payout = quai::parse_payout(user)?;
+    quai::check_worker(user)?;
+    let token = match token_file {
+        Some(f) => {
+            let t = std::fs::read_to_string(f)
+                .map_err(|e| format!("cannot read the auth token file {}: {e}", f.display()))?;
+            let t = t.trim().to_string();
+            if t.is_empty() {
+                return Err(format!("the auth token file {} is empty", f.display()));
+            }
+            Some(t)
+        }
+        None => None,
     };
-    let token = std::fs::read_to_string(f)
-        .map_err(|e| format!("cannot read the auth token file {}: {e}", f.display()))?;
-    let token = token.trim();
-    if token.is_empty() {
-        return Err(format!("the auth token file {} is empty", f.display()));
+    let (pass, notes) = quai::compose_password(pass, token.as_deref(), lock)?;
+    let host = qkm_stratum::Pool {
+        url: url.to_string(),
+        user: user.to_string(),
+        pass: String::new(),
     }
-    Ok(if pass.is_empty() {
-        format!("auth={token}")
-    } else {
-        format!("auth={token},{pass}")
-    })
+    .host_port()
+    .to_string();
+    let l = notes.lock.unwrap_or(0);
+    let mut msgs = vec![format!(
+        "{host}: paying {} on {} (lock {l}: {})",
+        payout.ledger,
+        payout.zone(),
+        quai::lock_meaning(l)
+    )];
+    msgs.extend(notes.warnings.into_iter().map(|w| format!("{host}: {w}")));
+    Ok((
+        qkm_stratum::Pool {
+            url: url.to_string(),
+            user: user.to_string(),
+            pass,
+        },
+        msgs,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -639,49 +692,64 @@ fn mine(
     status_secs: Option<u64>,
     no_dag_prefetch: bool,
     start_stagger: Option<f64>,
+    lock: Option<u8>,
+    temp_limit: Option<u32>,
+    temp_resume: Option<u32>,
+    report_hashrate: bool,
     no_tui: bool,
     log_file: Option<std::path::PathBuf>,
     tune: Tuning,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     use quai_kawpow_miner::miner::{MinerConfig, run as run_miner};
     use quai_kawpow_miner::stats::Stats;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let file = read_config(config.as_deref())?;
-    let pool_list = if pools.is_empty() {
-        file.pools
-            .iter()
-            .map(|p| {
-                Ok(qkm_stratum::Pool {
-                    url: p.url.clone(),
-                    user: p.user.clone(),
-                    pass: password(&p.pass, p.auth_token_file.as_deref())?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?
+    let lock = lock.or(file.lock);
+    if lock.is_some_and(|l| l > 3) {
+        return Err("lock must be 0, 1, 2 or 3".into());
+    }
+    let mut notes = Vec::new();
+    let mut pool_list = Vec::new();
+    if pools.is_empty() {
+        for p in &file.pools {
+            let (pool, n) = login(&p.url, &p.user, &p.pass, p.auth_token_file.as_deref(), lock)?;
+            pool_list.push(pool);
+            notes.extend(n);
+        }
     } else {
         let user = user.ok_or("--user 0xADDRESS.worker is required with --pool")?;
-        let pass = password(&pass, auth_token_file.as_deref())?;
-        pools
-            .iter()
-            .map(|u| qkm_stratum::Pool {
-                url: u.clone(),
-                user: user.clone(),
-                pass: pass.clone(),
-            })
-            .collect()
-    };
+        for u in &pools {
+            let (pool, n) = login(u, &user, &pass, auth_token_file.as_deref(), lock)?;
+            pool_list.push(pool);
+            notes.extend(n);
+        }
+    }
     if pool_list.is_empty() {
         return Err("no pool: give --pool or a [[pool]] in --config".into());
     }
+    qkm_cuda::libraries().map_err(|e| e.to_string())?;
     let mut cfg = MinerConfig::new(pool_list);
     cfg.devices = mine_devices(devices.as_deref(), device, &file)?;
     cfg.status_every = Duration::from_secs(status_secs.or(file.status_secs).unwrap_or(30).max(1));
     cfg.dag_prefetch = !no_dag_prefetch && file.dag_prefetch.unwrap_or(true);
     let stagger = start_stagger.or(file.start_stagger).unwrap_or(5.0);
-    cfg.start_stagger = Duration::try_from_secs_f64(stagger)
-        .map_err(|_| format!("bad --start-stagger {stagger}"))?;
+    if !(0.0..=60.0).contains(&stagger) {
+        return Err(format!("start stagger {stagger}: 0 to 60 seconds").into());
+    }
+    cfg.start_stagger = Duration::from_secs_f64(stagger);
+    cfg.temp_limit = match temp_limit.or(file.temp_limit).unwrap_or(90) {
+        0 => None,
+        l => Some(l),
+    };
+    cfg.temp_resume = temp_resume.or(file.temp_resume);
+    if let (Some(l), Some(r)) = (cfg.temp_limit, cfg.temp_resume)
+        && r >= l
+    {
+        return Err(format!("the resume temperature {r}C must be below the limit {l}C").into());
+    }
+    cfg.report_hashrate = report_hashrate || file.report_hashrate.unwrap_or(false);
     cfg.tune = file.tune.with(&tune);
     cfg.tune.check()?;
     let stats = Arc::new(Stats::new(&cfg.devices));
@@ -690,11 +758,19 @@ fn mine(
     ctrlc::set_handler(move || s.store(true, Ordering::SeqCst))
         .map_err(|e| format!("signal handler: {e}"))?;
     let log_file = log_file.or(file.log_file);
+    // The log file first: a bad path must fail before the screen is taken.
+    quai_kawpow_miner::output::init(log_file.as_deref()).map_err(|e| {
+        let p = log_file.as_deref().map(|p| p.display().to_string());
+        format!("log file {}: {e}", p.unwrap_or_default())
+    })?;
     let want_tui =
         !no_tui && file.tui.unwrap_or(true) && std::io::IsTerminal::is_terminal(&std::io::stdout());
     let tui = if want_tui {
         match quai_kawpow_miner::tui::start(stats.clone(), stop.clone(), log_file.as_deref()) {
-            Ok(h) => Some(h),
+            Ok(h) => {
+                quai_kawpow_miner::output::set_tui(true);
+                Some(h)
+            }
             Err(e) => {
                 eprintln!("cannot start the full-screen view ({e}); printing log lines");
                 None
@@ -703,10 +779,12 @@ fn mine(
     } else {
         None
     };
-    quai_kawpow_miner::output::init(tui.is_some(), log_file.as_deref()).map_err(|e| {
-        let p = log_file.as_deref().map(|p| p.display().to_string());
-        format!("log file {}: {e}", p.unwrap_or_default())
-    })?;
+    for n in notes {
+        quai_kawpow_miner::output::event(format!(
+            "{} {n}",
+            quai_kawpow_miner::miner::now_hms()
+        ));
+    }
     if let Some(addr) = api.or(file.api) {
         match quai_kawpow_miner::api::serve(addr, stats.clone()) {
             Ok(bound) => quai_kawpow_miner::output::event(format!(
@@ -718,11 +796,17 @@ fn mine(
                 if let Some(h) = tui {
                     let _ = h.join();
                 }
-                return Err(format!("API on {addr}: {e}"));
+                return Err(format!("API on {addr}: {e}").into());
             }
         }
     }
-    let r = run_miner(cfg, stop.clone(), stats.clone());
+    let r = run_miner(cfg, stop.clone(), stats.clone()).map_err(|f| {
+        if f.permanent {
+            CliError::Config(f.reason)
+        } else {
+            CliError::Runtime(f.reason)
+        }
+    });
     stop.store(true, Ordering::SeqCst);
     if let Some(h) = tui {
         let _ = h.join();
@@ -735,15 +819,31 @@ fn mine(
     r
 }
 
+/// Running as root (`sudo ... tune`).
+fn is_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
 fn read_config(path: Option<&std::path::Path>) -> Result<FileConfig, String> {
-    match path {
-        Some(p) => {
-            let text = std::fs::read_to_string(p)
-                .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-            toml::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))
+    let Some(p) = path else {
+        return Ok(FileConfig::default());
+    };
+    let text =
+        std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+    toml::from_str(&text).map_err(|e| {
+        // As root, never echo the file: `sudo ... --config /etc/shadow`
+        // would print what the user may not read.
+        if is_root() {
+            let at = e.span().map_or(String::new(), |s| {
+                let line = text[..s.start.min(text.len())].matches('\n').count() + 1;
+                format!(" at line {line}")
+            });
+            format!("{}: not a valid configuration{at} (details hidden when running as root)", p.display())
+        } else {
+            format!("{}: {e}", p.display())
         }
-        None => Ok(FileConfig::default()),
-    }
+    })
 }
 
 /// `tune`: apply, show or reset the GPU settings.
@@ -799,7 +899,14 @@ fn mine_devices(
         Some(_) => Vec::new(),
         None => match (device, &file.devices, file.device) {
             (Some(d), ..) => vec![d],
-            (None, Some(ds), _) => ds.clone(),
+            (None, Some(ds), _) => {
+                let mut seen = ds.clone();
+                seen.sort_unstable();
+                if seen.windows(2).any(|w| w[0] == w[1]) {
+                    return Err(format!("devices {ds:?}: a device is listed twice"));
+                }
+                ds.clone()
+            }
             (None, None, Some(d)) => vec![d],
             (None, None, None) => Vec::new(),
         },
@@ -835,9 +942,70 @@ fn parse_devices(s: &str) -> Result<Vec<usize>, String> {
     Ok(out)
 }
 
-fn run(cli: Cli) -> Result<(), String> {
+/// `devices`: what CUDA and NVML see.
+fn list_devices() -> Result<(), String> {
+    qkm_cuda::libraries().map_err(|e| e.to_string())?;
+    let n = qkm_cuda::device_count().map_err(|e| e.to_string())?;
+    let nvml = nvml_wrapper::Nvml::init().ok();
+    if nvml.is_none() {
+        println!("(NVML unavailable: no power or temperature)");
+    }
+    for d in 0..n {
+        let bus = qkm_cuda::pci_bus_id(d).unwrap_or_else(|_| "?".into());
+        let line = match Gpu::new(d) {
+            Ok(g) => {
+                let total = g.memory().map_or(0, |m| m.1) as f64 / f64::from(1u32 << 30);
+                format!("{} (sm_{}{}), {total:.2} GiB", g.name, g.arch.0, g.arch.1)
+            }
+            Err(e) => format!("cannot open: {e}"),
+        };
+        let extra = nvml
+            .as_ref()
+            .and_then(|n| n.device_by_pci_bus_id(bus.as_str()).ok())
+            .map(|dev| {
+                let t = dev
+                    .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
+                    .map_or("-".into(), |t| format!("{t}C"));
+                let pl = dev
+                    .power_management_limit()
+                    .map_or("-".into(), |p| format!("{} W", p / 1000));
+                format!(", {t}, power limit {pl}")
+            })
+            .unwrap_or_default();
+        println!("{d}: {bus}  {line}{extra}");
+    }
+    Ok(())
+}
+
+/// How a command failed: exit code 2 when only a fix helps (configuration,
+/// a refusal from every pool), 1 otherwise.
+#[derive(Debug)]
+enum CliError {
+    Config(String),
+    Runtime(String),
+}
+
+impl From<String> for CliError {
+    fn from(e: String) -> Self {
+        CliError::Config(e)
+    }
+}
+
+impl From<&str> for CliError {
+    fn from(e: &str) -> Self {
+        CliError::Config(e.to_string())
+    }
+}
+
+fn run(cli: Cli) -> Result<(), CliError> {
     let device = cli.device.unwrap_or(0);
-    match cli.cmd {
+    if matches!(
+        cli.cmd,
+        Cmd::Verify { .. } | Cmd::Bench { .. } | Cmd::Compile { .. } | Cmd::Tune { .. }
+    ) {
+        qkm_cuda::libraries().map_err(|e| e.to_string())?;
+    }
+    let r: Result<(), String> = match cli.cmd {
         Cmd::Mine {
             pools,
             user,
@@ -849,10 +1017,14 @@ fn run(cli: Cli) -> Result<(), String> {
             no_dag_prefetch,
             devices,
             start_stagger,
+            lock,
+            temp_limit,
+            temp_resume,
+            report_hashrate,
             no_tui,
             log_file,
             tune: t,
-        } => mine(
+        } => return mine(
             cli.device,
             devices,
             pools,
@@ -864,10 +1036,15 @@ fn run(cli: Cli) -> Result<(), String> {
             status_secs,
             no_dag_prefetch,
             start_stagger,
+            lock,
+            temp_limit,
+            temp_resume,
+            report_hashrate,
             no_tui,
             log_file,
             t.tuning(),
         ),
+        Cmd::Devices => list_devices(),
         Cmd::Tune {
             devices,
             config,
@@ -957,15 +1134,23 @@ fn run(cli: Cli) -> Result<(), String> {
                 &unroll,
             )
         }
-    }
+    };
+    r.map_err(CliError::Runtime)
 }
 
+/// Exit codes: 0 stopped on purpose; 1 failed at run time (a supervisor
+/// should restart it); 2 a configuration problem or a refusal from every
+/// pool (restarting will not help).
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+        Err(CliError::Runtime(e)) => {
             eprintln!("error: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(1)
+        }
+        Err(CliError::Config(e)) => {
+            eprintln!("error: {e}");
+            ExitCode::from(2)
         }
     }
 }

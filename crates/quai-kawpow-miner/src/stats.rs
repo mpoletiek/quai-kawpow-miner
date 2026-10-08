@@ -23,6 +23,10 @@ pub enum GpuState {
     Mining,
     /// A GPU error; retrying after a pause (the reason is in the log).
     Error,
+    /// Paused at the temperature limit until it cools to the resume point.
+    TooHot,
+    /// Given up after repeated errors.
+    Failed,
 }
 
 /// Telemetry of one device (NVML).
@@ -82,6 +86,8 @@ fn state_name(g: &GpuState) -> String {
     match g {
         GpuState::Idle => "idle".to_string(),
         GpuState::Error => "error".to_string(),
+        GpuState::TooHot => "too hot".to_string(),
+        GpuState::Failed => "failed".to_string(),
         GpuState::BuildingDag(e) => format!("building DAG {e}"),
         GpuState::Mining => "mining".to_string(),
     }
@@ -91,6 +97,8 @@ fn state_json(g: &GpuState) -> Value {
     match g {
         GpuState::Idle => json!({"state": "idle"}),
         GpuState::Error => json!({"state": "error"}),
+        GpuState::TooHot => json!({"state": "too_hot"}),
+        GpuState::Failed => json!({"state": "failed"}),
         GpuState::BuildingDag(e) => json!({"state": "building_dag", "epoch": e}),
         GpuState::Mining => json!({"state": "mining"}),
     }
@@ -147,6 +155,8 @@ pub struct View {
     pub pool: String,
     /// The stratum user.
     pub worker: String,
+    /// Where the rewards go (`Qi · cyprus1 · lock 2`).
+    pub payout: String,
     /// The current job id and height.
     pub job: Option<(String, u64)>,
     /// Stratum difficulty.
@@ -188,6 +198,8 @@ pub struct GpuStats {
     pub accepted: AtomicU64,
     /// Its shares not accepted (refused, stale or lost).
     pub refused: AtomicU64,
+    /// Held at the temperature limit (set by the coordinator).
+    pub paused: AtomicBool,
     samples: Mutex<VecDeque<(Instant, u64)>>,
     state: Mutex<GpuState>,
     reading: Mutex<(String, DeviceReading)>,
@@ -202,6 +214,7 @@ impl GpuStats {
             hashes: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
             samples: Mutex::new(VecDeque::new()),
             state: Mutex::new(GpuState::Idle),
             reading: Mutex::new((String::new(), DeviceReading::default())),
@@ -225,6 +238,11 @@ impl GpuStats {
         *lock(&self.state) = g;
     }
 
+    /// What the GPU is doing.
+    pub fn state(&self) -> GpuState {
+        lock(&self.state).clone()
+    }
+
     /// The device name and its latest reading.
     pub fn set_reading(&self, name: &str, r: DeviceReading) {
         *lock(&self.reading) = (name.to_string(), r);
@@ -244,9 +262,12 @@ pub struct Stats {
     pub lost: AtomicU64,
     /// GPU solutions the CPU check refused (bugs; never submitted).
     pub gpu_errors: AtomicU64,
+    /// GPU solutions dropped because the CPU check fell behind.
+    pub dropped: AtomicU64,
     /// Connected and authorized.
     pub connected: AtomicBool,
     worker: Mutex<String>,
+    payout: Mutex<String>,
     gpus: Vec<GpuStats>,
     samples: Mutex<VecDeque<(Instant, u64)>>,
     /// Which GPU found each share in flight (by share sequence number).
@@ -275,8 +296,10 @@ impl Stats {
             stale: AtomicU64::new(0),
             lost: AtomicU64::new(0),
             gpu_errors: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
             connected: AtomicBool::new(false),
             worker: Mutex::new(String::new()),
+            payout: Mutex::new(String::new()),
             gpus: devices.iter().map(|&d| GpuStats::new(d)).collect(),
             samples: Mutex::new(VecDeque::new()),
             owners: Mutex::new(HashMap::new()),
@@ -334,6 +357,11 @@ impl Stats {
     /// The stratum user (`0xADDRESS.worker`).
     pub fn set_worker(&self, w: &str) {
         *lock(&self.worker) = w.to_string();
+    }
+
+    /// Where the rewards go, e.g. `Qi · cyprus1 · lock 2`.
+    pub fn set_payout(&self, p: &str) {
+        *lock(&self.payout) = p.to_string();
     }
 
     /// The current stratum difficulty.
@@ -404,6 +432,7 @@ impl Stats {
             connected: self.connected.load(Ordering::Relaxed),
             pool: lock(&self.pool).clone(),
             worker: lock(&self.worker).clone(),
+            payout: lock(&self.payout).clone(),
             job: lock(&self.job).clone(),
             difficulty: *lock(&self.difficulty),
             rate_1m: self.hashrate(Duration::from_secs(60)),
@@ -530,6 +559,185 @@ impl Stats {
             .collect()
     }
 
+    /// Everything, in Prometheus' text format (`/metrics`).
+    pub fn prometheus(&self) -> String {
+        use std::fmt::Write as _;
+        fn esc(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+        }
+        let mut o = String::new();
+        let mut metric = |name: &str, kind: &str, help: &str, rows: Vec<(String, f64)>| {
+            let _ = writeln!(o, "# HELP {name} {help}");
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+            for (labels, v) in rows {
+                if labels.is_empty() {
+                    let _ = writeln!(o, "{name} {v}");
+                } else {
+                    let _ = writeln!(o, "{name}{{{labels}}} {v}");
+                }
+            }
+        };
+        let one = |v: f64| vec![(String::new(), v)];
+        metric("qkm_up", "gauge", "The miner is running.", one(1.0));
+        metric(
+            "qkm_uptime_seconds",
+            "counter",
+            "Seconds since the miner started.",
+            one(self.uptime().as_secs_f64()),
+        );
+        metric(
+            "qkm_hashrate_hashes_per_second",
+            "gauge",
+            "Hashrate of all GPUs.",
+            vec![
+                ("window=\"1m\"".into(), self.hashrate(Duration::from_secs(60))),
+                ("window=\"10m\"".into(), self.hashrate(Duration::from_secs(600))),
+            ],
+        );
+        metric(
+            "qkm_hashes_total",
+            "counter",
+            "Nonces hashed by all GPUs.",
+            one(self.hashes() as f64),
+        );
+        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64;
+        metric(
+            "qkm_shares_total",
+            "counter",
+            "Share answers from the pool.",
+            vec![
+                ("result=\"accepted\"".into(), ld(&self.accepted)),
+                ("result=\"rejected\"".into(), ld(&self.rejected)),
+                ("result=\"stale\"".into(), ld(&self.stale)),
+                ("result=\"lost\"".into(), ld(&self.lost)),
+            ],
+        );
+        metric(
+            "qkm_gpu_errors_total",
+            "counter",
+            "GPU solutions the CPU check refused (never submitted).",
+            one(ld(&self.gpu_errors)),
+        );
+        metric(
+            "qkm_dropped_solutions_total",
+            "counter",
+            "GPU solutions dropped because the CPU check fell behind.",
+            one(ld(&self.dropped)),
+        );
+        metric(
+            "qkm_pool_connected",
+            "gauge",
+            "Connected and authorized.",
+            one(f64::from(u8::from(self.connected.load(Ordering::Relaxed)))),
+        );
+        metric(
+            "qkm_difficulty",
+            "gauge",
+            "Stratum share difficulty.",
+            one(*lock(&self.difficulty)),
+        );
+        metric(
+            "qkm_job_height",
+            "gauge",
+            "Donor height of the current job.",
+            one(lock(&self.job).as_ref().map_or(0.0, |(_, h)| *h as f64)),
+        );
+        let per_gpu = |f: &dyn Fn(&GpuStats, &DeviceReading) -> Option<f64>| -> Vec<(String, f64)> {
+            self.gpus
+                .iter()
+                .filter_map(|g| {
+                    let (name, r) = lock(&g.reading).clone();
+                    let labels = format!(
+                        "device=\"{}\",bus=\"{}\",name=\"{}\"",
+                        g.device,
+                        esc(&lock(&g.bus)),
+                        esc(&name)
+                    );
+                    f(g, &r).map(|v| (labels, v))
+                })
+                .collect()
+        };
+        metric(
+            "qkm_gpu_hashrate_hashes_per_second",
+            "gauge",
+            "Hashrate per GPU (1 minute).",
+            per_gpu(&|g, _| Some(g.hashrate(Duration::from_secs(60)))),
+        );
+        metric(
+            "qkm_gpu_hashes_total",
+            "counter",
+            "Nonces hashed per GPU.",
+            per_gpu(&|g, _| Some(g.hashes.load(Ordering::Relaxed) as f64)),
+        );
+        metric(
+            "qkm_gpu_shares_accepted_total",
+            "counter",
+            "Shares accepted, per GPU that found them.",
+            per_gpu(&|g, _| Some(g.accepted.load(Ordering::Relaxed) as f64)),
+        );
+        metric(
+            "qkm_gpu_shares_refused_total",
+            "counter",
+            "Shares not accepted, per GPU that found them.",
+            per_gpu(&|g, _| Some(g.refused.load(Ordering::Relaxed) as f64)),
+        );
+        metric(
+            "qkm_gpu_mining",
+            "gauge",
+            "1 when the GPU is hashing.",
+            per_gpu(&|g, _| Some(f64::from(u8::from(g.state() == GpuState::Mining)))),
+        );
+        metric(
+            "qkm_gpu_paused",
+            "gauge",
+            "1 when the GPU is paused at the temperature limit.",
+            per_gpu(&|g, _| Some(f64::from(u8::from(g.paused.load(Ordering::Relaxed))))),
+        );
+        metric(
+            "qkm_gpu_temperature_celsius",
+            "gauge",
+            "GPU core temperature.",
+            per_gpu(&|_, r| r.temperature_c.map(f64::from)),
+        );
+        metric(
+            "qkm_gpu_power_watts",
+            "gauge",
+            "GPU board power.",
+            per_gpu(&|_, r| r.power_w),
+        );
+        metric(
+            "qkm_gpu_power_limit_watts",
+            "gauge",
+            "GPU power limit.",
+            per_gpu(&|_, r| r.power_limit_w),
+        );
+        metric(
+            "qkm_gpu_fan_percent",
+            "gauge",
+            "GPU fan speed.",
+            per_gpu(&|_, r| r.fan_pct.map(f64::from)),
+        );
+        metric(
+            "qkm_gpu_sm_clock_mhz",
+            "gauge",
+            "GPU core clock.",
+            per_gpu(&|_, r| r.sm_clock_mhz.map(f64::from)),
+        );
+        metric(
+            "qkm_gpu_mem_clock_mhz",
+            "gauge",
+            "GPU memory clock.",
+            per_gpu(&|_, r| r.mem_clock_mhz.map(f64::from)),
+        );
+        metric(
+            "qkm_gpu_utilization_percent",
+            "gauge",
+            "GPU utilization.",
+            per_gpu(&|_, r| r.util_pct.map(f64::from)),
+        );
+        o
+    }
+
     /// Everything, for the JSON API.
     pub fn json(&self) -> Value {
         let lat = lock(&self.latency_ms).clone();
@@ -589,12 +797,14 @@ impl Stats {
                 "stale": self.stale.load(Ordering::Relaxed),
                 "lost": self.lost.load(Ordering::Relaxed),
                 "gpu_errors": self.gpu_errors.load(Ordering::Relaxed),
+                "dropped": self.dropped.load(Ordering::Relaxed),
                 "last_accept_s": lock(&self.last_accept).map(|t| t.elapsed().as_secs()),
                 "last_reject": *lock(&self.last_reject),
                 "avg_latency_ms": avg_lat,
             },
             "difficulty": *lock(&self.difficulty),
             "worker": *lock(&self.worker),
+            "payout": *lock(&self.payout),
             "job": lock(&self.job).clone().map(|(id, h)| json!({"id": id, "height": h, "epoch": h / 7500})),
             "gpus": gpus,
         })

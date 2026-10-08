@@ -987,7 +987,7 @@ dependencies = [
 [[package]]
 name = "rsq-gomath"
 version = "0.0.1"
-source = "git+https://github.com/mpoletiek/rs-quai.git?branch=main#dbd388df6424932ec854e40737cc11975a4d7b58"
+source = "git+https://github.com/mpoletiek/rs-quai.git?rev=dbd388df6424932ec854e40737cc11975a4d7b58#dbd388df6424932ec854e40737cc11975a4d7b58"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -996,7 +996,7 @@ dependencies = [
 [[package]]
 name = "rsq-params"
 version = "0.0.1"
-source = "git+https://github.com/mpoletiek/rs-quai.git?branch=main#dbd388df6424932ec854e40737cc11975a4d7b58"
+source = "git+https://github.com/mpoletiek/rs-quai.git?rev=dbd388df6424932ec854e40737cc11975a4d7b58#dbd388df6424932ec854e40737cc11975a4d7b58"
 dependencies = [
  "blake3",
  "rsq-gomath",
@@ -1006,7 +1006,7 @@ dependencies = [
 [[package]]
 name = "rsq-pow"
 version = "0.0.1"
-source = "git+https://github.com/mpoletiek/rs-quai.git?branch=main#dbd388df6424932ec854e40737cc11975a4d7b58"
+source = "git+https://github.com/mpoletiek/rs-quai.git?rev=dbd388df6424932ec854e40737cc11975a4d7b58#dbd388df6424932ec854e40737cc11975a4d7b58"
 dependencies = [
  "rsq-params",
  "sha3",
@@ -1015,7 +1015,7 @@ dependencies = [
 [[package]]
 name = "rsq-primitives"
 version = "0.0.1"
-source = "git+https://github.com/mpoletiek/rs-quai.git?branch=main#dbd388df6424932ec854e40737cc11975a4d7b58"
+source = "git+https://github.com/mpoletiek/rs-quai.git?rev=dbd388df6424932ec854e40737cc11975a4d7b58#dbd388df6424932ec854e40737cc11975a4d7b58"
 
 [[package]]
 name = "rustc_version"

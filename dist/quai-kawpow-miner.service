@@ -1,0 +1,30 @@
+# quai-kawpow-miner as a systemd service.
+#   sudo cp quai-kawpow-miner /usr/local/bin/
+#   sudo install -D -m 0644 miner.toml /etc/quai-kawpow-miner/miner.toml
+#   sudo cp quai-kawpow-miner.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now quai-kawpow-miner
+# Follow it with: journalctl -fu quai-kawpow-miner (or the log file).
+[Unit]
+Description=quai-kawpow-miner (KawPoW GPU miner for Quai Network)
+Wants=network-online.target
+After=network-online.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+# Applies [tune] (as root), then mines as the unprivileged user below.
+ExecStartPre=+/usr/local/bin/quai-kawpow-miner tune --config /etc/quai-kawpow-miner/miner.toml
+ExecStart=/usr/local/bin/quai-kawpow-miner mine --config /etc/quai-kawpow-miner/miner.toml --no-tui
+User=miner
+# Exit 1: a run-time failure (restart); exit 2: configuration or every pool
+# refused us (a restart will not help).
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2
+# For libnvrtc when the CUDA toolkit is not on the default library path:
+#Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -63,14 +63,46 @@ pub enum Message {
 /// Parse errors are plain text; a bad line is logged and skipped.
 pub type ParseError = String;
 
-fn unhex(s: &str) -> Result<Vec<u8>, ParseError> {
-    let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    if !s.len().is_multiple_of(2) {
-        return Err(format!("odd-length hex: {s}"));
+/// Longest text from the pool that goes into the log.
+pub const MAX_LOGGED: usize = 200;
+
+/// Pool text made safe to log: control characters (terminal escapes) become
+/// `?` and it is cut to `max` characters.
+pub fn sanitize(s: &str, max: usize) -> String {
+    let mut out: String = s
+        .chars()
+        .take(max)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if s.chars().nth(max).is_some() {
+        out.push('…');
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("bad hex {s}: {e}")))
+    out
+}
+
+/// Hex to bytes, by bytes (pool data: anything but ASCII hex digits is an
+/// error, never a panic).
+pub fn unhex(s: &str) -> Result<Vec<u8>, ParseError> {
+    let t = s.trim();
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    let b = t.as_bytes();
+    if !b.len().is_multiple_of(2) {
+        return Err(format!("odd-length hex: {}", sanitize(t, 80)));
+    }
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    b.chunks_exact(2)
+        .map(|p| match (nibble(p[0]), nibble(p[1])) {
+            (Some(h), Some(l)) => Ok(h << 4 | l),
+            _ => Err(format!("bad hex: {}", sanitize(t, 80))),
+        })
         .collect()
 }
 
@@ -124,13 +156,20 @@ pub fn parse_line(line: &str) -> Result<Message, ParseError> {
                     other => other.to_string(),
                 };
                 let target = p.get(3).and_then(|t| hex32(t, "target").ok());
+                let height = as_u64(&p[5]).ok_or("bad height")?;
+                if !qkm_core::plausible_height(height) {
+                    return Err(format!(
+                        "height {height} is past epoch {} (a broken or hostile pool)",
+                        qkm_core::MAX_EPOCH
+                    ));
+                }
                 Ok(Message::Notify(Job {
                     id,
                     header: hex32(&p[1], "header hash")?,
                     seed: hex32(&p[2], "seed hash")?,
                     target,
                     clean: p.get(4).and_then(Value::as_bool).unwrap_or(false),
-                    height: as_u64(&p[5]).ok_or("bad height")?,
+                    height,
                     bits: p.get(6).and_then(Value::as_str).unwrap_or("").to_string(),
                 }))
             }
@@ -199,19 +238,19 @@ pub fn submit_params(
     ])
 }
 
-/// The error text of a response (`null` → `None`).
+/// The error text of a response (`null` → `None`), safe to log.
 pub fn error_text(error: &Value) -> Option<String> {
-    match error {
-        Value::Null => None,
-        Value::String(s) => Some(s.clone()),
-        Value::Array(a) => Some(
-            a.iter()
-                .map(|x| x.as_str().map_or_else(|| x.to_string(), str::to_string))
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-        other => Some(other.to_string()),
-    }
+    let t = match error {
+        Value::Null => return None,
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a
+            .iter()
+            .map(|x| x.as_str().map_or_else(|| x.to_string(), str::to_string))
+            .collect::<Vec<_>>()
+            .join(" "),
+        other => other.to_string(),
+    };
+    Some(sanitize(&t, MAX_LOGGED))
 }
 
 /// KawPoW stratum difficulty 1 (`0x00000000ff000000…`, 2^40/255 hashes).
@@ -268,11 +307,13 @@ pub fn difficulty_of_target(target: &[u8; 32]) -> f64 {
     KAWPOW_DIFF1_TOP * 2f64.powi(216) / v
 }
 
-/// Replaces the value of `auth=` in a password or URL with `<redacted>`.
+/// Replaces the value of `auth=` (any case) in a password or URL with
+/// `<redacted>`.
 pub fn redact(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some(i) = rest.find("auth=") {
+    // ASCII lower-casing keeps byte offsets.
+    while let Some(i) = rest.to_ascii_lowercase().find("auth=") {
         out.push_str(&rest[..i + 5]);
         out.push_str("<redacted>");
         let tail = &rest[i + 5..];
@@ -335,6 +376,49 @@ mod tests {
             "stratum+tcp://0x00.w:auth=<redacted>@10.0.0.13:3333"
         );
         assert_eq!(redact("x"), "x");
+        assert_eq!(redact("AUTH=abc,d=1"), "AUTH=<redacted>,d=1");
+    }
+
+    #[test]
+    fn hostile_lines_are_errors_not_panics() {
+        // Multi-byte characters where hex belongs (once a panic).
+        let bad = r#"{"id":null,"method":"mining.notify","params":["j","aé00000000000000000000000000000000000000000000000000000000000001","bb","00",true,1,"1b"]}"#;
+        assert!(parse_line(bad).is_err());
+        assert!(parse_line(r#"{"id":null,"method":"mining.set_extranonce","params":["é"]}"#).is_err());
+        assert_eq!(subscribe_extranonce(&json!([null, "éé"])), Vec::<u8>::new());
+        assert!(unhex("zz").is_err());
+        assert_eq!(unhex("0XAbC0").unwrap(), vec![0xab, 0xc0]);
+        // A height far past any real epoch.
+        let far = format!(
+            r#"{{"id":null,"method":"mining.notify","params":["j","{0}","{0}","00",true,{1},"1b"]}}"#,
+            "00".repeat(32),
+            u64::MAX
+        );
+        assert!(parse_line(&far).unwrap_err().contains("hostile"));
+        // Garbage of every sort.
+        for l in ["", "{", "[]", "null", r#"{"id":"x"}"#, r#"{"method":"mining.notify","params":[1,2,3,4,5,6]}"#] {
+            let _ = parse_line(l);
+        }
+    }
+
+    #[test]
+    fn pool_text_is_sanitized() {
+        assert_eq!(sanitize("ok\u{1b}[2Jboom", 100), "ok?[2Jboom");
+        assert_eq!(sanitize(&"a".repeat(300), 5), "aaaaa…");
+        assert_eq!(
+            error_text(&json!("\u{1b}]0;pwned\u{7}duplicate share")).unwrap(),
+            "?]0;pwned?duplicate share"
+        );
+    }
+
+    #[test]
+    fn target_round_trip_across_the_range() {
+        for d in [1e-6, 0.001, 0.1, 0.2, 1.0, 12.5, 1e3, 1e6, 1e9, 1e12] {
+            let back = difficulty_of_target(&target_for_difficulty(d));
+            assert!((back - d).abs() / d < 1e-9, "{d} -> {back}");
+        }
+        assert_eq!(target_for_difficulty(0.0), [0xff; 32]);
+        assert_eq!(target_for_difficulty(f64::NAN), [0xff; 32]);
     }
 
     #[test]
