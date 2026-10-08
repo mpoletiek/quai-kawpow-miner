@@ -139,6 +139,8 @@ pub enum Event {
         /// Why.
         reason: String,
     },
+    /// Something worth logging (e.g. a line from the pool that was skipped).
+    Notice(String),
 }
 
 enum Cmd {
@@ -393,7 +395,10 @@ fn session(
                 let msg = match parse_line(&line) {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("stratum: skipping a line ({e}): {}", redact(&line));
+                        let _ = events.send(Event::Notice(format!(
+                            "stratum: skipping a line ({e}): {}",
+                            redact(&line)
+                        )));
                         continue;
                     }
                 };

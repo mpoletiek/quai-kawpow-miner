@@ -97,7 +97,25 @@ matters little (block 256, grid 256, two streams is the default); a DAG from
     quai-kawpow-miner bench --height 4565235 --seconds 30
     quai-kawpow-miner bench --block 128,256 --grid 256,1824 --streams 2,3   # sweep
 
-`mine`:
+`mine` takes over the terminal with a live view of the rig:
+- a header with the worker, the pool connection and the uptime;
+- the total hashrate with its last ten minutes as a graph, the shares
+  (accepted, rejected, stale, lost; the last one's age), the job, height,
+  epoch and difficulty, the pool's answer time, the rig's power draw and
+  efficiency;
+- a row per GPU with what nvidia-smi would show (temperature, fan, power
+  against its limit, core and memory clocks, utilization, VRAM, P-state,
+  PCIe link, and why the clocks are held down: power cap, thermal...) next
+  to its hashrate, shares and the age of its last share. Temperatures turn
+  yellow at 70°C and red at 80°C; a GPU in error shows red. Columns drop by
+  priority on narrow terminals;
+- the log (shares say which GPU found them).
+
+`q` twice (or Ctrl-C) stops the miner; arrows, PgUp/PgDn and Home/End scroll
+the log. `--no-tui`, or a stdout that is not a terminal, prints the log and a
+status line instead. `--log-file PATH` keeps both in a file either way.
+
+`mine` options:
 - `--pool` takes `host:port` or `stratum+tcp://host:port`; repeat it for
   failover, in order of preference. The miner returns to the first pool
   after ten minutes on a backup.
@@ -126,6 +144,7 @@ matters little (block 256, grid 256, two streams is the default); a DAG from
 - `--config miner.toml` holds the same settings:
 
       devices = [0, 1, 2]        # default: every GPU
+      log_file = "/home/you/qkm/miner.log"
       api = "127.0.0.1:4073"
       status_secs = 60
       start_stagger = 5

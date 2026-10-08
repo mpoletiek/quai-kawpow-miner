@@ -108,6 +108,13 @@ enum Cmd {
         /// GPUs don't change load all at once.
         #[arg(long, value_name = "SECS")]
         start_stagger: Option<f64>,
+        /// Print log lines instead of the full-screen view (the default when
+        /// stdout is not a terminal).
+        #[arg(long)]
+        no_tui: bool,
+        /// Append the log and the status lines to this file.
+        #[arg(long, value_name = "PATH")]
+        log_file: Option<std::path::PathBuf>,
         #[command(flatten)]
         tune: TuneArgs,
     },
@@ -583,6 +590,8 @@ struct FileConfig {
     status_secs: Option<u64>,
     dag_prefetch: Option<bool>,
     start_stagger: Option<f64>,
+    tui: Option<bool>,
+    log_file: Option<std::path::PathBuf>,
     #[serde(default)]
     tune: TuneConfig,
     #[serde(default, rename = "pool")]
@@ -630,6 +639,8 @@ fn mine(
     status_secs: Option<u64>,
     no_dag_prefetch: bool,
     start_stagger: Option<f64>,
+    no_tui: bool,
+    log_file: Option<std::path::PathBuf>,
     tune: Tuning,
 ) -> Result<(), String> {
     use quai_kawpow_miner::miner::{MinerConfig, run as run_miner};
@@ -674,16 +685,54 @@ fn mine(
     cfg.tune = file.tune.with(&tune);
     cfg.tune.check()?;
     let stats = Arc::new(Stats::new(&cfg.devices));
-    if let Some(addr) = api.or(file.api) {
-        let bound = quai_kawpow_miner::api::serve(addr, stats.clone())
-            .map_err(|e| format!("API on {addr}: {e}"))?;
-        println!("API: http://{bound}/");
-    }
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
     ctrlc::set_handler(move || s.store(true, Ordering::SeqCst))
         .map_err(|e| format!("signal handler: {e}"))?;
-    run_miner(cfg, stop, stats)
+    let log_file = log_file.or(file.log_file);
+    let want_tui =
+        !no_tui && file.tui.unwrap_or(true) && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let tui = if want_tui {
+        match quai_kawpow_miner::tui::start(stats.clone(), stop.clone(), log_file.as_deref()) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("cannot start the full-screen view ({e}); printing log lines");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    quai_kawpow_miner::output::init(tui.is_some(), log_file.as_deref()).map_err(|e| {
+        let p = log_file.as_deref().map(|p| p.display().to_string());
+        format!("log file {}: {e}", p.unwrap_or_default())
+    })?;
+    if let Some(addr) = api.or(file.api) {
+        match quai_kawpow_miner::api::serve(addr, stats.clone()) {
+            Ok(bound) => quai_kawpow_miner::output::event(format!(
+                "{} API: http://{bound}/",
+                quai_kawpow_miner::miner::now_hms()
+            )),
+            Err(e) => {
+                stop.store(true, Ordering::SeqCst);
+                if let Some(h) = tui {
+                    let _ = h.join();
+                }
+                return Err(format!("API on {addr}: {e}"));
+            }
+        }
+    }
+    let r = run_miner(cfg, stop.clone(), stats.clone());
+    stop.store(true, Ordering::SeqCst);
+    if let Some(h) = tui {
+        let _ = h.join();
+        // The screen is gone: leave the totals behind.
+        println!("{} {}", quai_kawpow_miner::miner::now_hms(), stats.line());
+        for l in stats.gpu_lines() {
+            println!("{l}");
+        }
+    }
+    r
 }
 
 fn read_config(path: Option<&std::path::Path>) -> Result<FileConfig, String> {
@@ -800,6 +849,8 @@ fn run(cli: Cli) -> Result<(), String> {
             no_dag_prefetch,
             devices,
             start_stagger,
+            no_tui,
+            log_file,
             tune: t,
         } => mine(
             cli.device,
@@ -813,6 +864,8 @@ fn run(cli: Cli) -> Result<(), String> {
             status_secs,
             no_dag_prefetch,
             start_stagger,
+            no_tui,
+            log_file,
             t.tuning(),
         ),
         Cmd::Tune {

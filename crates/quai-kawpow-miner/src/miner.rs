@@ -83,7 +83,7 @@ pub fn now_hms() -> String {
 }
 
 macro_rules! log {
-    ($($a:tt)*) => { println!("{} {}", now_hms(), format!($($a)*)) };
+    ($($a:tt)*) => { crate::output::event(format!("{} {}", now_hms(), format!($($a)*))) };
 }
 
 /// One unit of GPU work.
@@ -209,7 +209,7 @@ fn gpu_thread(c: GpuCtx) {
             Err(e) => {
                 failures += 1;
                 log!("gpu{dev}: GPU error ({failures}): {e}; retrying");
-                c.stats.gpus()[c.index].set_state(GpuState::Idle);
+                c.stats.gpus()[c.index].set_state(GpuState::Error);
                 let wait = Duration::from_secs(u64::from(failures.min(6)) * 5);
                 let until = Instant::now() + wait;
                 while Instant::now() < until && !c.stop.load(Ordering::SeqCst) {
@@ -511,6 +511,9 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
         match Gpu::new(d) {
             Ok(gpu) => {
                 let gpu = Arc::new(gpu);
+                if let Ok(bus) = qkm_cuda::pci_bus_id(d) {
+                    stats.gpus()[i].set_bus(&bus);
+                }
                 log!(
                     "gpu{d}: {} (sm_{}{}), {:.2} GiB",
                     gpu.name,
@@ -531,6 +534,9 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
     }
     if gpus.is_empty() {
         return Err(format!("no usable GPU among devices {:?}", cfg.devices));
+    }
+    if let Some(p) = cfg.pools.first() {
+        stats.set_worker(&p.user);
     }
     for (i, p) in cfg.pools.iter().enumerate() {
         log!(
@@ -673,20 +679,23 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                 error,
                 latency,
             } => {
-                stats.share_result(seq, accepted, error.as_deref(), latency);
+                let by = stats
+                    .share_result(seq, accepted, error.as_deref(), latency)
+                    .map_or_else(String::new, |d| format!(" from gpu{d}"));
                 if accepted {
                     log!(
-                        "share {seq} accepted ({} ms)  A{}",
+                        "share {seq}{by} accepted ({} ms)  A{}",
                         latency.as_millis(),
                         stats.accepted.load(Ordering::Relaxed)
                     );
                 } else {
                     log!(
-                        "share {seq} not accepted: {}",
+                        "share {seq}{by} not accepted: {}",
                         error.unwrap_or_else(|| "rejected".into())
                     );
                 }
             }
+            Event::Notice(n) => log!("{n}"),
             Event::Disconnected { reason } => {
                 log!("disconnected: {}", redact(&reason));
                 stats.connected.store(false, Ordering::Relaxed);
@@ -707,14 +716,15 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
     Ok(())
 }
 
-/// The status line, then one line per GPU when there are several.
+/// The status line, then one line per GPU when there are several (stdout
+/// in plain mode, the log file either way).
 fn print_status(stats: &Stats) {
     let mut out = format!("{} {}", now_hms(), stats.line());
     for l in stats.gpu_lines() {
         out.push('\n');
         out.push_str(&l);
     }
-    println!("{out}");
+    crate::output::status(&out);
 }
 
 /// Applies the GPU settings, one line per GPU; failures are logged and
@@ -750,9 +760,25 @@ pub fn apply_tuning(devices: &[usize], tune: &TuneConfig) {
         lines.push(format!("gpu{d}: tuning: {}{flag}", a.text));
     }
     if set > 0 && failed > 0 && failed == denied {
-        log!(
-            "tuning: not root, GPU settings left as they are (apply them with `sudo quai-kawpow-miner tune`)"
-        );
+        // Not root: the settings come from `sudo quai-kawpow-miner tune`.
+        // Power limits can be read without root, so check those.
+        let off: Vec<String> = devices
+            .iter()
+            .filter_map(|&d| {
+                let want = tune.for_device(d).power_limit?;
+                let id = qkm_cuda::pci_bus_id(d).ok()?;
+                let have = nvml.device_by_pci_bus_id(id).ok()?.power_management_limit().ok()? / 1000;
+                (have != want).then(|| format!("gpu{d} {have} W (want {want} W)"))
+            })
+            .collect();
+        if off.is_empty() {
+            log!("tuning: not root; using the GPUs' current settings (power limits are as configured)");
+        } else {
+            log!(
+                "tuning: not root and the GPUs are not as configured: {}; run `sudo quai-kawpow-miner tune` with the same settings",
+                off.join(", ")
+            );
+        }
         return;
     }
     for l in lines {

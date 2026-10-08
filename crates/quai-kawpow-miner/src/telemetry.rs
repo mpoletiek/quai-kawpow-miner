@@ -1,6 +1,7 @@
 //! GPU telemetry through NVML (loaded at runtime; absent → no readings).
 
 use nvml_wrapper::Nvml;
+use nvml_wrapper::bitmasks::device::ThrottleReasons;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 
 use crate::stats::DeviceReading;
@@ -39,6 +40,38 @@ impl Telemetry {
             fan_pct: d.fan_speed(0).ok(),
             mem_clock_mhz: d.clock_info(Clock::Memory).ok(),
             sm_clock_mhz: d.clock_info(Clock::SM).ok(),
+            util_pct: d.utilization_rates().ok().map(|u| u.gpu),
+            vram: d.memory_info().ok().map(|m| (m.used, m.total)),
+            pstate: d
+                .performance_state()
+                .ok()
+                .map(|p| p.as_c())
+                .filter(|&p| p < 16),
+            throttle: d
+                .current_throttle_reasons()
+                .map(throttle_names)
+                .unwrap_or_default(),
+            pcie: d
+                .current_pcie_link_gen()
+                .ok()
+                .zip(d.current_pcie_link_width().ok()),
         }
     }
+}
+
+/// Short names for the reasons the clocks are held down (idle and the
+/// application/user clock settings are left out: they are not slowdowns).
+fn throttle_names(r: ThrottleReasons) -> Vec<&'static str> {
+    [
+        (ThrottleReasons::SW_POWER_CAP, "power cap"),
+        (ThrottleReasons::HW_SLOWDOWN, "HW slowdown"),
+        (ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN, "power brake"),
+        (ThrottleReasons::SW_THERMAL_SLOWDOWN, "thermal"),
+        (ThrottleReasons::HW_THERMAL_SLOWDOWN, "HW thermal"),
+        (ThrottleReasons::SYNC_BOOST, "sync boost"),
+    ]
+    .into_iter()
+    .filter(|(b, _)| r.contains(*b))
+    .map(|(_, n)| n)
+    .collect()
 }
