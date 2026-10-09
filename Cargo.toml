@@ -9,14 +9,11 @@ rust-version = "1.97"
 license = "GPL-3.0-only"
 repository = "https://github.com/mpoletiek/quai-kawpow-miner"
 
-[workspace.dependencies]
-# Pinned: the KawPoW every share is checked against; move it deliberately.
-rsq-pow = { git = "https://github.com/mpoletiek/rs-quai.git", rev = "dbd388df6424932ec854e40737cc11975a4d7b58" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
-# Dependencies (rsq-pow's light cache and hashing) optimized in debug builds
+# Dependencies optimized in debug builds
 # and tests: an epoch's light cache takes minutes unoptimized.
 [profile.dev.package."*"]
 opt-level = 3

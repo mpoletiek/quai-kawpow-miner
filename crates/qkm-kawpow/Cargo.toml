@@ -1,0 +1,18 @@
+[package]
+name = "qkm-kawpow"
+description = "KawPoW in pure Rust: ProgPoW with Ravencoin's padding, ethash light caches, CPU light evaluation (ported from rs-quai's rsq-pow, verified against go-quai)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+sha3 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"

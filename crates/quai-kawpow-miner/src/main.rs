@@ -1,7 +1,7 @@
 //! quai-kawpow-miner: KawPoW GPU miner for Quai Network.
 //!
 //! Commands: `mine` (stratum mining), `verify` (GPU against rs-quai's
-//! `rsq-pow`), `bench` (hashrate, with a launch-geometry sweep), `compile`
+//! `qkm-kawpow`), `bench` (hashrate, with a launch-geometry sweep), `compile`
 //! and `kernel`.
 
 use std::process::ExitCode;
@@ -152,7 +152,7 @@ enum Cmd {
         #[command(flatten)]
         tune: TuneArgs,
     },
-    /// Compare the GPU's mix digests and final hashes with rsq-pow's, and
+    /// Compare the GPU's mix digests and final hashes with qkm-kawpow's, and
     /// check that every solution the search kernel reports verifies.
     Verify {
         /// Donor heights to test (one DAG each).
@@ -321,7 +321,7 @@ fn verify(
             },
         )
         .map_err(|e| e.to_string())?;
-        // 1) Every nonce: mix digest and final hash against rsq-pow.
+        // 1) Every nonce: mix digest and final hash against qkm-kawpow.
         let header = rng.bytes32();
         let start = rng.next();
         let got = searcher
@@ -417,7 +417,7 @@ fn verify(
         failures += sol_bad;
         // 3) Coverage: the search kernel must report exactly the nonces whose
         // final hash meets the target, per the debug kernel (checked against
-        // rsq-pow above). Small launches keep under MAX_RESULTS per launch.
+        // qkm-kawpow above). Small launches keep under MAX_RESULTS per launch.
         let mut cov_target = [0xffu8; 32];
         cov_target[0] = 0x00;
         cov_target[1] = 0x0f; // 1 in 4096

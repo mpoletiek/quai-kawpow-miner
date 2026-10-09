@@ -1,12 +1,12 @@
 //! The per-period ProgPoW program that KawPoW runs in each of its 64 DAG
-//! loops, taken from `rsq_pow::common::init(period)` and the KISS99
-//! sequence exactly as `rsq_pow::common::prog_loop` consumes it.
+//! loops, taken from `qkm_kawpow::common::init(period)` and the KISS99
+//! sequence exactly as `qkm_kawpow::common::prog_loop` consumes it.
 //!
 //! The GPU kernel is generated from this program (see `kernel`); the tests
 //! interpret it on the CPU and require the result to equal
-//! `rsq_pow::common::prog_loop`, the code rs-quai and go-quai agree on.
+//! `qkm_kawpow::common::prog_loop`, the code rs-quai and go-quai agree on.
 
-use rsq_pow::common::{
+use qkm_kawpow::common::{
     CACHE_WORDS, CNT_CACHE, CNT_MATH, DAG_LOADS, LANES, REGS, init, math, merge,
 };
 
@@ -96,7 +96,7 @@ impl Program {
     }
 
     /// One DAG loop on the CPU, with the same arguments and effect as
-    /// `rsq_pow::common::prog_loop(self.period, loop_, ...)`.
+    /// `qkm_kawpow::common::prog_loop(self.period, loop_, ...)`.
     pub fn run_loop(
         &self,
         loop_: u32,
@@ -143,7 +143,7 @@ impl Program {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsq_pow::common::prog_loop;
+    use qkm_kawpow::common::prog_loop;
 
     /// xorshift64* for test data.
     struct Rng(u64);
@@ -157,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn program_matches_rsq_pow_prog_loop() {
+    fn program_matches_reference_prog_loop() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let cdag: Vec<u32> = (0..CACHE_WORDS).map(|_| rng.next()).collect();
         // A deterministic fake DAG: entry words are a hash of the base.

@@ -7,11 +7,13 @@ Quai's KawPoW work is merge-mined with Ravencoin: miners hash a Ravencoin
 donor header that commits to a Quai block, through a Quai node's stratum
 (rs-quai, or go-quai 0.56 and later). This miner is built for that setup:
 
-- **The node's own algorithm.** KawPoW comes from
-  [rs-quai](https://github.com/mpoletiek/rs-quai)'s `rsq-pow`, which is
-  verified against go-quai across the whole mainnet chain. The GPU kernels
-  are generated from the same code, and every share is checked on the CPU
-  before it is sent, so the miner never submits a bad share.
+- **The node's own algorithm.** KawPoW comes from `crates/qkm-kawpow`,
+  ported from [rs-quai](https://github.com/mpoletiek/rs-quai)'s `rsq-pow`,
+  which is verified against go-quai across the whole mainnet chain; it
+  passes go-quai's Ravencoin block vectors. The GPU kernels are generated
+  from the same code, and every share is checked on the CPU before it is
+  sent, so the miner never submits a bad share. The miner builds on its
+  own: no dependency on rs-quai.
 - **Quai, done right.** The payout address is checked (40 hex digits, its
   zone) and the miner says where the rewards go: the Quai or the Qi ledger,
   which zone, and the coinbase lockup (`--lock 0..3`, with its reward
@@ -168,7 +170,7 @@ status line instead.
   `dist/miner.example.toml` has a commented copy.
 
 Other commands: `devices` (CUDA and NVML's view), `tune` (below), `verify`
-(the GPU against `rsq-pow`, nonce by nonce), `bench` (hashrate, with sweeps
+(the GPU against the CPU reference, nonce by nonce), `bench` (hashrate, with sweeps
 of the launch geometry: `bench --block 128,256 --grid 256,1824 --streams
 2,3`), `compile` and `kernel` (the generated CUDA source).
 
@@ -228,7 +230,7 @@ What it does on its own:
   it for good); after eight the GPU is given up. A GPU at the temperature
   limit pauses until it cools. A GPU that stops hashing for two minutes
   ends the miner with code 1, for the supervisor to restart.
-- **Shares.** Every GPU solution is checked with `rsq-pow`; a mismatch is
+- **Shares.** Every GPU solution is checked on the CPU; a mismatch is
   logged as a GPU bug and never sent. The CPU check queue is bounded; drops
   are counted and logged with a hint to raise `d`.
 
@@ -281,7 +283,10 @@ one miner at a time, 15 minutes each after 90 s of warm-up.
 
 ## Correctness
 
-- `verify` compares the GPU with `rsq-pow` nonce by nonce: 0 differences in
+- `qkm-kawpow` passes go-quai's KawPoW tests: the Ravencoin block vectors,
+  the first KawPoW block and a GPU-mined share
+  (`cargo test -p qkm-kawpow --release -- --ignored`).
+- `verify` compares the GPU with `qkm-kawpow` nonce by nonce: 0 differences in
   768 mix digests and final hashes at epochs 0, 300 and 608 (plus the next
   period's kernel at each); over 2^20 nonces the search kernel reports
   exactly the nonces whose hash meets the target (241 of 241); over 2^31
@@ -297,7 +302,8 @@ one miner at a time, 15 minutes each after 90 s of warm-up.
       cargo test --release -p quai-kawpow-miner --test gpu_mock -- --ignored --test-threads 1
 
 Layout: `crates/qkm-core` (program, kernel sources, epochs, CPU
-verification), `crates/qkm-cuda` (the cudarc backend), `crates/qkm-stratum`
+verification), `crates/qkm-kawpow` (KawPoW on the CPU: the reference),
+`crates/qkm-cuda` (the cudarc backend), `crates/qkm-stratum`
 (the stratum client and mock pool), `crates/quai-kawpow-miner` (the miner,
 its screen, API, tuning and the binary).
 
@@ -309,4 +315,5 @@ its screen, API, tuning and the binary).
 
 ## License
 
-GPL-3.0-only (it links rs-quai's GPL-3.0 `rsq-pow`).
+GPL-3.0-only. `crates/qkm-kawpow` is ported from rs-quai's GPL-3.0
+`rsq-pow`.

@@ -8,7 +8,7 @@
 //!   thread that builds or drops its DAG, so an epoch switch can never race
 //!   a build. The GPUs share the work, the light caches and the compiled
 //!   kernels, and each searches its own part of the nonce space;
-//! - the submit thread: checks each GPU solution with rsq-pow and submits
+//! - the submit thread: checks each GPU solution with qkm-kawpow and submits
 //!   the ones that meet the target;
 //! - the stratum client's threads, and the API thread when enabled.
 
@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qkm_core::kernel::SearchParams;
-use qkm_core::rsq_pow::kawpow::PARAMS;
+use qkm_core::qkm_kawpow::kawpow::PARAMS;
 use qkm_core::{EPOCH_LENGTH, Epoch, Verifier, boundary64, meets};
 use qkm_cuda::{Cubins, Dag, Geometry, Gpu, Header, Kernels, Searcher};
 use qkm_stratum::{
@@ -487,7 +487,7 @@ const CANDIDATE_QUEUE: usize = 256;
 /// Final hashes of recent shares remembered to never send one twice.
 const SENT_REMEMBERED: usize = 4096;
 
-/// The submit thread: rsq-pow checks every solution; mismatches are GPU
+/// The submit thread: qkm-kawpow checks every solution; mismatches are GPU
 /// bugs and are never submitted, and a share already sent is not sent
 /// again. (Quai nodes count a share by its final hash, header and nonce, and
 /// re-send the same work under a new job id after every accepted share: a
@@ -507,7 +507,7 @@ fn submit_thread(
         if words_le(&h.mix) != c.mix {
             stats.gpu_errors.fetch_add(1, Ordering::Relaxed);
             log!(
-                "BUG: gpu{}'s mix for nonce {:#018x} at height {} differs from rsq-pow's; not submitted",
+                "BUG: gpu{}'s mix for nonce {:#018x} at height {} differs from the CPU reference's; not submitted",
                 stats.gpus().get(c.gpu).map_or(c.gpu, |g| g.device),
                 c.nonce,
                 c.work.height

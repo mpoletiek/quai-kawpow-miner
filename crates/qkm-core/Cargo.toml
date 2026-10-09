@@ -1,6 +1,6 @@
 [package]
 name = "qkm-core"
-description = "KawPoW for GPU miners: the per-period ProgPoW program (from rs-quai's rsq-pow), CUDA kernel sources, epochs and CPU verification."
+description = "KawPoW for GPU miners: the per-period ProgPoW program (from qkm-kawpow), CUDA kernel sources, epochs and CPU verification."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,4 +12,4 @@ publish = false
 workspace = true
 
 [dependencies]
-rsq-pow = { workspace = true }
+qkm-kawpow = { path = "../qkm-kawpow" }

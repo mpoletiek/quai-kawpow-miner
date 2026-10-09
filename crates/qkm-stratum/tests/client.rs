@@ -1,5 +1,5 @@
 //! The client against the mock pool, which checks shares the way rs-quai's
-//! stratum does. Shares are mined on the CPU with rsq-pow at epoch 0.
+//! stratum does. Shares are mined on the CPU with qkm-kawpow at epoch 0.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::net::TcpListener;

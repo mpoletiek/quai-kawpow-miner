@@ -9,7 +9,7 @@
 use std::fmt::Write;
 
 use crate::program::{Op, Program};
-use rsq_pow::kawpow::RAVENCOIN_KAWPOW;
+use qkm_kawpow::kawpow::RAVENCOIN_KAWPOW;
 
 /// Most solutions one launch reports (`out[0]` is the count, then `gid`
 /// and 8 mix words per solution).

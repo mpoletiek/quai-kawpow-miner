@@ -1,13 +1,13 @@
-//! KawPoW epochs and CPU verification (rs-quai's `rsq-pow`).
+//! KawPoW epochs and CPU verification (`qkm-kawpow` (ported from rs-quai's `qkm-kawpow`)).
 //!
 //! Heights are Ravencoin donor heights: 7,500 blocks per epoch, a new
 //! ProgPoW program every 3 blocks.
 
 use std::sync::Arc;
 
-use rsq_pow::common::PROGPOW_MIX_BYTES;
-use rsq_pow::kawpow::{PARAMS, PERIOD_LENGTH, kawpow_light};
-use rsq_pow::{EpochCache, EpochCaches};
+use qkm_kawpow::common::PROGPOW_MIX_BYTES;
+use qkm_kawpow::kawpow::{PARAMS, PERIOD_LENGTH, kawpow_light};
+use qkm_kawpow::{EpochCache, EpochCaches};
 
 /// Blocks per epoch.
 pub const EPOCH_LENGTH: u64 = 7500;
@@ -61,7 +61,7 @@ impl Epoch {
 
     /// The modulus of the per-loop DAG offset, in 256-byte entries
     /// (`64 * (size / 256) / (LANES * DAG_LOADS)` in u32 arithmetic, as in
-    /// `rsq_pow::common::prog_loop`).
+    /// `qkm_kawpow::common::prog_loop`).
     pub fn dag_elements(&self) -> u32 {
         let ds = (self.dataset_bytes / PROGPOW_MIX_BYTES) as u32;
         64u32.wrapping_mul(ds) / 64
@@ -82,7 +82,7 @@ impl Default for Verifier {
 }
 
 /// A KawPoW evaluation: the mix digest and the final hash, both as the
-/// little-endian words `rsq-pow` produces.
+/// little-endian words `qkm-kawpow` produces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hashes {
     /// The 256-bit mix digest.

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use qkm_core::Verifier;
-use qkm_core::rsq_pow::kawpow::PARAMS;
+use qkm_core::qkm_kawpow::kawpow::PARAMS;
 use serde_json::{Value, json};
 
 use crate::proto::hex0x;
