@@ -233,6 +233,21 @@ __device__ __forceinline__ void kawpow_hash_one(const uint64_t nonce, const head
 #pragma unroll
         for (int i = 0; i < PROGPOW_REGS; i++)
             fnv1a(lane_digest, mix[i]);
+#if QKM_LEAN_DIGEST
+        // digest[j] = fnv(fnv(OFFSET, lane j's), lane j + 8's): lane j < 8
+        // folds its own with lane j + 8's (one shuffle), then lane h
+        // gathers the 8 (eight shuffles) instead of every lane computing
+        // all 8 from 16 shuffles.
+        uint32_t dj = FNV_OFFSET;
+        fnv1a(dj, lane_digest);
+        fnv1a(dj, SHFL(lane_digest, lane_id + 8, PROGPOW_LANES));
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const uint32_t v = SHFL(dj, i, PROGPOW_LANES);
+            if (h == lane_id)
+                digest[i] = v;
+        }
+#else
         uint32_t d[8];
 #pragma unroll
         for (int i = 0; i < 8; i++)
@@ -244,6 +259,7 @@ __device__ __forceinline__ void kawpow_hash_one(const uint64_t nonce, const head
         if (h == lane_id)
             for (int i = 0; i < 8; i++)
                 digest[i] = d[i];
+#endif
     }
     {
         uint32_t st[25];
@@ -359,6 +375,10 @@ pub struct SearchParams {
     pub fence: bool,
     /// Unroll factor of the 64-iteration DAG loop.
     pub unroll: u32,
+    /// Reduce the lane digests with 9 shuffles instead of 16 (kawpowminer's
+    /// way when off). On: +0.7% kH/W on an RTX 3060 Ti at 225 W (6
+    /// interleaved pairs).
+    pub lean_digest: bool,
 }
 
 impl Default for SearchParams {
@@ -369,6 +389,7 @@ impl Default for SearchParams {
             dag_load: DagLoad::Ldg,
             fence: true,
             unroll: 1,
+            lean_digest: true,
         }
     }
 }
@@ -386,6 +407,7 @@ pub fn search_source(p: &Program, dag_elements: u32, params: SearchParams) -> St
     }
     let _ = writeln!(s, "#define DAG_LOAD(p) {}", params.dag_load.expr());
     let _ = writeln!(s, "#define QKM_MAX_RESULTS {MAX_RESULTS}u");
+    let _ = writeln!(s, "#define QKM_LEAN_DIGEST {}", u8::from(params.lean_digest));
     let words: Vec<String> = RAVENCOIN_KAWPOW
         .iter()
         .map(|w| format!("0x{w:02x}u"))

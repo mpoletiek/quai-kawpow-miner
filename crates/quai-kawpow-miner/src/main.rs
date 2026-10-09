@@ -167,6 +167,9 @@ enum Cmd {
         /// Seed for the random headers and nonces.
         #[arg(long, default_value_t = 0x5155_4149)]
         seed: u64,
+        /// Check kawpowminer's lane-digest reduction instead of the lean one.
+        #[arg(long)]
+        classic_digest: bool,
     },
     /// Hashrate for one or more launch geometries (one DAG build).
     Bench {
@@ -198,6 +201,14 @@ enum Cmd {
         /// DAG loop unroll factor (comma-separated to sweep).
         #[arg(long, value_delimiter = ',', default_value = "1")]
         unroll: Vec<u32>,
+        /// Lean lane-digest reduction: 1 (the default) or 0 (kawpowminer's;
+        /// comma-separated to sweep).
+        #[arg(long, value_delimiter = ',', default_value = "1")]
+        lean_digest: Vec<u8>,
+        /// Run the whole list this many times (alternating A/B cancels
+        /// drift in temperature and clocks).
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
     },
     /// Compile the search kernel for a height (NVRTC only; no DAG).
     Compile {
@@ -272,7 +283,14 @@ fn build_dag(gpu: &Gpu, verifier: &Verifier, height: u64) -> Result<Dag, String>
     Ok(dag)
 }
 
-fn verify(gpu: &Gpu, heights: &[u64], cases: u32, block: u32, seed: u64) -> Result<(), String> {
+fn verify(
+    gpu: &Gpu,
+    heights: &[u64],
+    cases: u32,
+    block: u32,
+    seed: u64,
+    lean_digest: bool,
+) -> Result<(), String> {
     let verifier = Verifier::default();
     let mut rng = Rng(seed | 1);
     let mut failures = 0u64;
@@ -282,6 +300,7 @@ fn verify(gpu: &Gpu, heights: &[u64], cases: u32, block: u32, seed: u64) -> Resu
             gpu,
             SearchParams {
                 block,
+                lean_digest,
                 ..SearchParams::default()
             },
         );
@@ -526,8 +545,14 @@ fn bench(
     min_blocks: &[u32],
     fences: &[u8],
     unrolls: &[u32],
+    leans: &[u8],
+    repeat: u32,
 ) -> Result<(), String> {
     let verifier = Verifier::default();
+    // Power for each run (NVML), for the efficiency under a power cap.
+    let telemetry = qkm_cuda::pci_bus_id(gpu.ctx.ordinal())
+        .ok()
+        .and_then(|id| quai_kawpow_miner::telemetry::Telemetry::open(Some(&id), 0));
     let dag = build_dag(gpu, &verifier, height)?;
     let sms = gpu
         .ctx
@@ -542,19 +567,25 @@ fn bench(
             for &mb in min_blocks {
                 for &fence in fences {
                     for &unroll in unrolls {
-                        variants.push(SearchParams {
-                            block,
-                            min_blocks: mb,
-                            dag_load,
-                            fence: fence != 0,
-                            unroll,
-                        });
+                        for &lean in leans {
+                            variants.push(SearchParams {
+                                block,
+                                min_blocks: mb,
+                                dag_load,
+                                fence: fence != 0,
+                                unroll,
+                                lean_digest: lean != 0,
+                            });
+                        }
                     }
                 }
             }
         }
     }
-    for params in variants {
+    let rounds = variants.len() * repeat.max(1) as usize;
+    let mut totals: std::collections::HashMap<String, (f64, f64, u32)> =
+        std::collections::HashMap::new();
+    for params in variants.iter().cycle().take(rounds).copied() {
         let block = params.block;
         let mut kernels = Kernels::new(gpu, params);
         let k = match kernels.get(gpu, height, dag.epoch) {
@@ -575,21 +606,50 @@ fn bench(
                     .run(&k, &dag, header, 0, 0, &mut |_, _| false)
                     .map_err(|e| e.to_string())?;
                 let t = Instant::now();
+                let mut power = (0.0f64, 0u32);
+                let mut last = Instant::now();
                 let (done, _) = searcher
                     .run(&k, &dag, header, 0, 1 << 40, &mut |_, _| {
+                        if last.elapsed() >= Duration::from_millis(500)
+                            && let Some(w) = telemetry.as_ref().and_then(|t| t.read().power_w)
+                        {
+                            last = Instant::now();
+                            power = (power.0 + w, power.1 + 1);
+                        }
                         t.elapsed().as_secs_f64() < seconds
                     })
                     .map_err(|e| e.to_string())?;
                 let mhs = done as f64 / t.elapsed().as_secs_f64() / 1e6;
+                let watts = (power.1 > 0).then(|| power.0 / f64::from(power.1));
                 let label = format!(
-                    "block {block} grid {grid} streams {s} load {:?} min_blocks {} fence {} unroll {}",
-                    params.dag_load, params.min_blocks, params.fence, params.unroll
+                    "block {block} grid {grid} streams {s} load {:?} min_blocks {} fence {} unroll {} lean {}",
+                    params.dag_load,
+                    params.min_blocks,
+                    params.fence,
+                    params.unroll,
+                    u8::from(params.lean_digest)
                 );
-                println!("{label}: {mhs:.2} MH/s");
+                match watts {
+                    Some(w) => println!("{label}: {mhs:.2} MH/s at {w:.0} W ({:.1} kH/W)", mhs * 1e3 / w),
+                    None => println!("{label}: {mhs:.2} MH/s"),
+                }
+                let e = totals.entry(label.clone()).or_default();
+                *e = (e.0 + mhs, e.1 + watts.map_or(0.0, |w| mhs * 1e3 / w), e.2 + 1);
                 if mhs > best.0 {
                     best = (mhs, label);
                 }
             }
+        }
+    }
+    if repeat > 1 {
+        let mut rows: Vec<_> = totals.into_iter().collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        for (label, (mhs, eff, n)) in rows {
+            println!(
+                "mean of {n}: {label}: {:.2} MH/s, {:.1} kH/W",
+                mhs / f64::from(n),
+                eff / f64::from(n)
+            );
         }
     }
     println!("best: {} at {:.2} MH/s", best.1, best.0);
@@ -1138,10 +1198,11 @@ fn run(cli: Cli) -> Result<(), CliError> {
             cases,
             block,
             seed,
+            classic_digest,
         } => {
             let gpu = Gpu::new(device).map_err(|e| e.to_string())?;
             println!("{} (sm_{}{})", gpu.name, gpu.arch.0, gpu.arch.1);
-            verify(&gpu, &heights, cases, block, seed)
+            verify(&gpu, &heights, cases, block, seed, !classic_digest)
         }
         Cmd::Bench {
             height,
@@ -1153,6 +1214,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             min_blocks,
             fence,
             unroll,
+            lean_digest,
+            repeat,
         } => {
             let loads = dag_load
                 .iter()
@@ -1171,6 +1234,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 &min_blocks,
                 &fence,
                 &unroll,
+                &lean_digest,
+                repeat,
             )
         }
     };
