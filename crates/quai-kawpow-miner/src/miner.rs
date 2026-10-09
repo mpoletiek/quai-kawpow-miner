@@ -916,8 +916,10 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
             }
         };
         match ev {
-            Event::Connected { url, session, .. } => {
-                log!("connected to {url}");
+            Event::Connected {
+                url, session, tls, ..
+            } => {
+                log!("connected to {url}{}", if tls { " (TLS)" } else { "" });
                 stats.set_pool(&url);
                 ps.session = session;
                 ps.authorized = false;

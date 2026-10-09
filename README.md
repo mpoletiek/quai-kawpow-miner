@@ -117,13 +117,16 @@ status line instead.
 ## Options
 
 `mine`:
-- `--pool URL` (`host:port` or `stratum+tcp://host:port`), repeated for
-  failover in order of preference. kawpowminer's form with the login in the
+- `--pool URL` (`host:port`, `stratum+tcp://host:port`, or
+  `stratum+ssl://host:port` for TLS), repeated for failover in order of
+  preference. kawpowminer's form with the login in the
   URL, `stratum+tcp://0xADDRESS.worker:d=1@host:port` (as in Quai's docs),
   works too; `--user` and `--pass` win over it. After ten minutes on a backup the miner
   probes the first pool every minute and goes back when it answers.
 - `--user 0xADDRESS.worker` (the worker name: letters, digits, `-`, `_`).
 - `--pass OPTIONS`, `--lock 0..3`, `--auth-token-file FILE`: see above.
+- `--tls-fingerprint SHA256` or `--tls-ca PEM`: how `stratum+ssl://` pools
+  are checked (see TLS below).
 - `--devices 0,1,2` (default `all`).
 - `--temp-limit C` (default 90; 0 turns it off) and `--temp-resume C`
   (default 15 below): a GPU that reaches the limit pauses until it cools.
@@ -162,12 +165,55 @@ status line instead.
       pass = "d=1"
       auth_token_file = "/home/you/.config/quai/stratum-token"
 
-      [[pool]]                   # a backup
-      url = "stratum+tcp://10.0.0.12:3333"
+      [[pool]]                   # a backup, over TLS
+      url = "stratum+ssl://node2.example:3443"
       user = "0xYOUR_ADDRESS.rig1"
       pass = "d=1"
+      tls_fingerprint = "AB:CD:..."   # or tls_ca = "/path/ca.pem"
 
   `dist/miner.example.toml` has a commented copy.
+
+## TLS
+
+Quai nodes serve stratum in the clear, auth token included. To mine across
+a network you don't trust, put a TLS proxy (stunnel, nginx `stream`,
+HAProxy) in front of the node and point the miner at it with
+`stratum+ssl://` (or `stratum+tls://`). With stunnel on the node:
+
+    # A self-signed certificate, and its fingerprint for the miner.
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        -days 3650 -subj /CN=quai-stratum -keyout stratum.key -out stratum.crt
+    cat stratum.crt stratum.key > /etc/stunnel/stratum.pem
+    openssl x509 -noout -fingerprint -sha256 -in stratum.crt
+
+    # /etc/stunnel/quai-stratum.conf
+    [quai-stratum]
+    accept = 0.0.0.0:3443
+    connect = 127.0.0.1:3333
+    cert = /etc/stunnel/stratum.pem
+
+    quai-kawpow-miner mine --pool stratum+ssl://node.example:3443 \
+        --tls-fingerprint AB:CD:... --user 0xYOUR_ADDRESS.rig1 --pass d=1 \
+        --auth-token-file ~/.config/quai/stratum-token
+
+Then keep the node's stratum port off the network (bind it to 127.0.0.1 or
+firewall it), so nothing can still reach it in the clear.
+
+The server's certificate is checked one of three ways:
+- **`--tls-fingerprint`** (`tls_fingerprint` in a `[[pool]]`): only the
+  certificate with this SHA-256, whatever its name, issuer or dates. This is
+  the one for a self-signed certificate. Colons and case don't matter, and
+  openssl's `sha256 Fingerprint=...` line is accepted as it is.
+- **`--tls-ca`** (`tls_ca`): a certificate for the pool's host name, issued
+  by a CA in this PEM file (your own CA).
+- **Neither**: a certificate for the host name from a public CA (Mozilla's
+  list, built in), as on a pool with a real certificate.
+
+On the command line, the TLS flags apply to every `stratum+ssl://` pool. When
+a certificate is refused, the log says why and gives its fingerprint, so you
+can compare it with the proxy's and pin it. The miner keeps retrying, as it
+would for a refused connection. TLS is rustls (TLS 1.2 and 1.3), with no
+OpenSSL needed.
 
 Other commands: `devices` (CUDA and NVML's view), `tune` (below), `verify`
 (the GPU against the CPU reference, nonce by nonce), `bench` (hashrate, with sweeps

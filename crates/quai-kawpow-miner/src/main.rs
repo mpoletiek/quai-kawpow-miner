@@ -30,6 +30,20 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// How `stratum+ssl://` pools given with `--pool` are checked.
+#[derive(Args, Clone, Default)]
+struct TlsArgs {
+    /// For `stratum+ssl://` pools: accept only the certificate with this
+    /// SHA-256 fingerprint (a self-signed one on your TLS proxy), e.g. from
+    /// `openssl x509 -noout -fingerprint -sha256 -in cert.pem`.
+    #[arg(long, value_name = "SHA256")]
+    tls_fingerprint: Option<String>,
+    /// For `stratum+ssl://` pools: trust the CAs in this PEM file instead of
+    /// Mozilla's.
+    #[arg(long, value_name = "PEM", conflicts_with = "tls_fingerprint")]
+    tls_ca: Option<std::path::PathBuf>,
+}
+
 /// GPU settings (setting them needs root; they last until reset or reboot).
 #[derive(Args, Clone, Default)]
 struct TuneArgs {
@@ -74,8 +88,9 @@ impl TuneArgs {
 enum Cmd {
     /// Mine through a Quai node's stratum (rs-quai or go-quai).
     Mine {
-        /// Pool `host:port` or `stratum+tcp://host:port`; repeat for
-        /// failover, in order of preference.
+        /// Pool `host:port`, `stratum+tcp://host:port`, or
+        /// `stratum+ssl://host:port` for TLS; repeat for failover, in order
+        /// of preference.
         #[arg(long = "pool")]
         pools: Vec<String>,
         /// `0xADDRESS.worker` (the payout address and a worker name).
@@ -129,6 +144,8 @@ enum Cmd {
         /// Append the log and the status lines to this file.
         #[arg(long, value_name = "PATH")]
         log_file: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        tls: TlsArgs,
         #[command(flatten)]
         tune: TuneArgs,
     },
@@ -686,6 +703,37 @@ struct FilePool {
     #[serde(default)]
     pass: String,
     auth_token_file: Option<std::path::PathBuf>,
+    tls_fingerprint: Option<String>,
+    tls_ca: Option<std::path::PathBuf>,
+}
+
+/// TLS for `url`: `None` unless it is a `stratum+ssl://` URL, which is
+/// checked against the pinned certificate, the CA file, or Mozilla's CAs.
+fn pool_tls(
+    url: &str,
+    fingerprint: Option<&str>,
+    ca: Option<&std::path::Path>,
+) -> Result<Option<qkm_stratum::Tls>, String> {
+    use qkm_stratum::{Tls, Trust, tls};
+    if !tls::wants_tls(url)? {
+        if fingerprint.is_some() || ca.is_some() {
+            return Err(format!(
+                "{url}: tls_fingerprint and tls_ca are for stratum+ssl:// pools"
+            ));
+        }
+        return Ok(None);
+    }
+    let trust = match (fingerprint, ca) {
+        (Some(_), Some(_)) => {
+            return Err(format!("{url}: give tls_fingerprint or tls_ca, not both"));
+        }
+        (Some(f), None) => {
+            Trust::Pinned(tls::parse_fingerprint(f).map_err(|e| format!("{url}: {e}"))?)
+        }
+        (None, Some(c)) => Trust::CaFile(c.to_path_buf()),
+        (None, None) => Trust::Public,
+    };
+    Tls::new(trust).map(Some).map_err(|e| format!("{url}: {e}"))
 }
 
 /// A pool URL in kawpowminer's form, `stratum+tcp://USER[:PASS]@host:port`
@@ -716,6 +764,7 @@ fn login(
     pass: &str,
     token_file: Option<&std::path::Path>,
     lock: Option<u8>,
+    tls: Option<qkm_stratum::Tls>,
 ) -> Result<(qkm_stratum::Pool, Vec<String>), String> {
     use quai_kawpow_miner::quai;
     let payout = quai::parse_payout(user)?;
@@ -737,6 +786,7 @@ fn login(
         url: url.to_string(),
         user: user.to_string(),
         pass: String::new(),
+        tls: None,
     }
     .host_port()
     .to_string();
@@ -747,12 +797,19 @@ fn login(
         payout.zone(),
         quai::lock_meaning(l)
     )];
+    if let Some(t) = &tls {
+        msgs.push(format!(
+            "{host}: TLS, certificate checked against {}",
+            t.trust()
+        ));
+    }
     msgs.extend(notes.warnings.into_iter().map(|w| format!("{host}: {w}")));
     Ok((
         qkm_stratum::Pool {
             url: url.to_string(),
             user: user.to_string(),
             pass,
+            tls,
         },
         msgs,
     ))
@@ -777,6 +834,7 @@ fn mine(
     report_hashrate: bool,
     no_tui: bool,
     log_file: Option<std::path::PathBuf>,
+    tls_args: TlsArgs,
     tune: Tuning,
 ) -> Result<(), CliError> {
     use quai_kawpow_miner::miner::{MinerConfig, run as run_miner};
@@ -794,11 +852,27 @@ fn mine(
     if pools.is_empty() {
         for p in &file.pools {
             let (bare, _, _) = split_login(&p.url);
-            let (pool, n) = login(&bare, &p.user, &p.pass, p.auth_token_file.as_deref(), lock)?;
+            let tls = pool_tls(&bare, p.tls_fingerprint.as_deref(), p.tls_ca.as_deref())?;
+            let (pool, n) = login(
+                &bare,
+                &p.user,
+                &p.pass,
+                p.auth_token_file.as_deref(),
+                lock,
+                tls,
+            )?;
             pool_list.push(pool);
             notes.extend(n);
         }
     } else {
+        let tls_given = tls_args.tls_fingerprint.is_some() || tls_args.tls_ca.is_some();
+        if tls_given
+            && !pools
+                .iter()
+                .any(|u| qkm_stratum::tls::wants_tls(u).unwrap_or(false))
+        {
+            return Err("--tls-fingerprint and --tls-ca are for stratum+ssl:// pools".into());
+        }
         for u in &pools {
             // --user and --pass win over a login in the URL.
             let (bare, url_user, url_pass) = split_login(u);
@@ -810,7 +884,17 @@ fn mine(
             } else {
                 pass.clone()
             };
-            let (pool, mut n) = login(&bare, &user, &pass, auth_token_file.as_deref(), lock)?;
+            // The TLS flags apply to every stratum+ssl:// pool.
+            let tls = if qkm_stratum::tls::wants_tls(&bare)? {
+                pool_tls(
+                    &bare,
+                    tls_args.tls_fingerprint.as_deref(),
+                    tls_args.tls_ca.as_deref(),
+                )?
+            } else {
+                None
+            };
+            let (pool, mut n) = login(&bare, &user, &pass, auth_token_file.as_deref(), lock, tls)?;
             if url_user.is_some() && url_user != Some(user.clone()) {
                 n.push(format!("{}: the user in the URL is ignored for --user", pool.host_port()));
             }
@@ -1122,6 +1206,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             report_hashrate,
             no_tui,
             log_file,
+            tls,
             tune: t,
         } => return mine(
             cli.device,
@@ -1141,6 +1226,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             report_hashrate,
             no_tui,
             log_file,
+            tls,
             t.tuning(),
         ),
         Cmd::Devices => list_devices(),
@@ -1278,6 +1364,25 @@ mod tests {
             ("node:3335".into(), Some("0xab.rig".into()), None)
         );
         assert_eq!(split_login("stratum+tcp://node:3333"), ("stratum+tcp://node:3333".into(), None, None));
+    }
+
+    #[test]
+    fn tls_from_the_url() {
+        let fp = "AB:".repeat(31) + "AB";
+        assert_eq!(pool_tls("node:3333", None, None), Ok(None));
+        assert!(pool_tls("stratum+tcp://node:3333", Some(&fp), None).is_err());
+        let t = pool_tls("stratum+ssl://node:3333", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.trust(), &qkm_stratum::Trust::Public);
+        let t = pool_tls("stratum+tls://node:3333", Some(&fp), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.trust(), &qkm_stratum::Trust::Pinned([0xab; 32]));
+        assert!(pool_tls("stratum+ssl://node:3333", Some("ab"), None).is_err());
+        assert!(pool_tls("stratum+ssl://n:1", Some(&fp), Some("/x.pem".as_ref())).is_err());
+        assert!(pool_tls("stratum+ssl://n:1", None, Some("/nonexistent.pem".as_ref())).is_err());
+        assert!(pool_tls("http://node:3333", None, None).is_err());
     }
 
     #[test]

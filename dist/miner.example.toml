@@ -41,7 +41,9 @@ report_hashrate = false
 #power_limit = 150
 
 # Pools, in order of preference. The user is the payout address (a Quai
-# address pays in Quai, a Qi address in Qi) and a worker name.
+# address pays in Quai, a Qi address in Qi) and a worker name. A
+# stratum+ssl:// URL is TLS (a TLS proxy in front of the node; see the
+# README's TLS section).
 [[pool]]
 url = "stratum+tcp://127.0.0.1:3333"
 user = "0xYOUR_ADDRESS.rig1"
@@ -50,7 +52,11 @@ pass = "d=1"
 # rs-quai's stratum token, if the node requires one (sent as auth=).
 #auth_token_file = "/etc/quai-kawpow-miner/stratum-token"
 
-#[[pool]]                     # a backup
-#url = "stratum+tcp://10.0.0.12:3333"
+#[[pool]]                     # a backup, over TLS
+#url = "stratum+ssl://node2.example:3443"
 #user = "0xYOUR_ADDRESS.rig1"
 #pass = "d=1"
+# The proxy's self-signed certificate (openssl x509 -noout -fingerprint
+# -sha256 -in cert.pem), or tls_ca for your own CA; neither = public CAs.
+#tls_fingerprint = "AB:CD:..."
+#tls_ca = "/etc/quai-kawpow-miner/ca.pem"

@@ -40,6 +40,7 @@ fn pool(addr: &str, pass: &str) -> Pool {
         url: format!("stratum+tcp://{addr}"),
         user: USER.into(),
         pass: pass.into(),
+        tls: None,
     }
 }
 

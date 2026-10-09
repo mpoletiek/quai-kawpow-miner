@@ -39,6 +39,7 @@ fn scenario(prefetch: bool) {
         url: pool.addr(),
         user: "0x00050723a3F8e87f704bb78014FE7791FAf344F5.gpu-test".into(),
         pass: "auth=tok,d=0.002".into(),
+        tls: None,
     }]);
     cfg.dag_prefetch = prefetch;
     cfg.status_every = Duration::from_secs(5);
@@ -110,6 +111,7 @@ fn mock_pool_all_gpus() {
         url: pool.addr(),
         user: "0x00050723a3F8e87f704bb78014FE7791FAf344F5.rig-test".into(),
         pass: "auth=tok,d=0.005".into(),
+        tls: None,
     }]);
     cfg.devices = devices.clone();
     cfg.status_every = Duration::from_secs(10);

@@ -8,6 +8,9 @@
 //! backup, the first pool is probed every minute and taken back once it
 //! answers. When every pool has refused authorization (a wrong address,
 //! lock or token: nothing a retry fixes), [`Event::Fatal`] ends the client.
+//!
+//! A pool with [`Pool::tls`] is reached over TLS ([`crate::tls`]); a
+//! refused certificate counts as a failed connection, like a refused port.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -22,6 +25,7 @@ use crate::proto::{
     Job, MAX_LOGGED, Message, error_text, parse_line, redact, request, sanitize, submit_params,
     subscribe_extranonce, target_for_difficulty,
 };
+use crate::tls::{Reader, Tls, Writer};
 
 /// Longest line accepted from a pool (Quai's are well under 1 KiB); a
 /// longer one ends the connection.
@@ -30,12 +34,16 @@ pub const MAX_LINE: usize = 64 * 1024;
 /// One pool.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pool {
-    /// `host:port` (a `stratum+tcp://` prefix is accepted).
+    /// `host:port` (a `stratum+tcp://` or `stratum+ssl://` prefix is
+    /// accepted; [`Pool::tls`], not the prefix, decides TLS).
     pub url: String,
     /// `0xADDRESS.worker`.
     pub user: String,
     /// Password, e.g. `auth=<token>,d=0.2`.
     pub pass: String,
+    /// Connect over TLS with these settings ([`crate::tls::wants_tls`]
+    /// tells from the URL whether a pool wants it).
+    pub tls: Option<Tls>,
 }
 
 impl Pool {
@@ -45,6 +53,13 @@ impl Pool {
         let u = u.split_once("://").map_or(u, |(_, rest)| rest);
         let u = u.rsplit_once('@').map_or(u, |(_, hp)| hp);
         u.trim_end_matches('/')
+    }
+
+    /// The host name or IP address, without the port or IPv6 brackets.
+    pub fn host(&self) -> &str {
+        let hp = self.host_port();
+        let h = hp.rsplit_once(':').map_or(hp, |(h, _)| h);
+        h.trim_start_matches('[').trim_end_matches(']')
     }
 
     /// The worker name sent with each share (the whole username).
@@ -122,6 +137,8 @@ pub enum Event {
         url: String,
         /// Connection number.
         session: u64,
+        /// Over TLS.
+        tls: bool,
     },
     /// The nonce prefix for this connection.
     Extranonce(Vec<u8>),
@@ -237,8 +254,61 @@ impl Drop for Client {
     }
 }
 
+/// The sending side of a connection.
+enum Out {
+    Plain(TcpStream),
+    Tls(Writer),
+}
+
+impl Out {
+    /// Closes the connection (both ways, which also ends the reader).
+    fn close(&mut self) {
+        match self {
+            Out::Plain(s) => {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            Out::Tls(w) => w.close(),
+        }
+    }
+}
+
+impl Write for Out {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Out::Plain(s) => s.write(buf),
+            Out::Tls(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Out::Plain(s) => s.flush(),
+            Out::Tls(w) => w.flush(),
+        }
+    }
+}
+
+/// A connected pool: the socket, and the TLS session over it if any.
+struct Link {
+    sock: TcpStream,
+    tls: Option<crate::tls::Session>,
+}
+
+/// Connects to `pool`, with the TLS handshake if it wants TLS.
+fn open(pool: &Pool, timeout: Duration) -> Result<Link, String> {
+    let sock = connect(pool.host_port(), timeout)?;
+    match &pool.tls {
+        None => Ok(Link { sock, tls: None }),
+        Some(t) => {
+            let s = t.connect(pool.host(), sock, timeout)?;
+            let sock = s.socket().try_clone().map_err(|e| format!("socket: {e}"))?;
+            Ok(Link { sock, tls: Some(s) })
+        }
+    }
+}
+
 fn send(
-    out: &mut TcpStream,
+    out: &mut Out,
     next_id: &mut u64,
     pending: &mut HashMap<u64, Pending>,
     method: &str,
@@ -311,7 +381,7 @@ struct Probe {
 }
 
 /// Reads lines of at most [`MAX_LINE`] bytes from the pool into `tx`.
-fn read_lines(read_half: TcpStream, session_id: u64, tx: &Sender<Cmd>) {
+fn read_lines(read_half: impl Read, session_id: u64, tx: &Sender<Cmd>) {
     let mut r = BufReader::new(read_half);
     let mut buf = Vec::new();
     loop {
@@ -356,24 +426,31 @@ fn hashrate_id() -> String {
 fn session(
     cfg: &Config,
     pool: &Pool,
-    stream: TcpStream,
+    link: Link,
     session_id: u64,
     probe: Option<Probe>,
     rx: &Receiver<Cmd>,
     tx: &Sender<Cmd>,
     events: &Sender<Event>,
 ) -> End {
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_write_timeout(Some(cfg.response_timeout));
-    let Ok(read_half) = stream.try_clone() else {
+    let Link { sock, tls } = link;
+    let _ = sock.set_nodelay(true);
+    let _ = sock.set_write_timeout(Some(cfg.response_timeout));
+    let Ok(read_half) = sock.try_clone() else {
         return End::Reconnect("cannot clone the socket".into());
     };
     let _ = read_half.set_read_timeout(Some(cfg.work_timeout + Duration::from_secs(30)));
+    let (reader, mut out): (Box<dyn Read + Send>, Out) = match tls {
+        None => (Box::new(read_half), Out::Plain(sock)),
+        Some(s) => {
+            let (r, w): (Reader, Writer) = s.split(read_half);
+            (Box::new(r), Out::Tls(w))
+        }
+    };
     let tx_r = tx.clone();
     let _ = std::thread::Builder::new()
         .name("stratum-read".into())
-        .spawn(move || read_lines(read_half, session_id, &tx_r));
-    let mut out = stream;
+        .spawn(move || read_lines(reader, session_id, &tx_r));
     let mut next_id = 1u64;
     let mut pending: HashMap<u64, Pending> = HashMap::new();
     if let Err(e) = send(
@@ -611,7 +688,7 @@ fn session(
             });
         }
     }
-    let _ = out.shutdown(Shutdown::Both);
+    out.close();
     end
 }
 
@@ -632,21 +709,22 @@ fn run(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Cmd>, events: Sender<Event>) {
     loop {
         let pool = &cfg.pools[idx];
         let url = pool.host_port().to_string();
-        let outcome = match connect(&url, cfg.connect_timeout) {
+        let outcome = match open(pool, cfg.connect_timeout) {
             Err(e) => Err(e),
-            Ok(stream) => {
+            Ok(link) => {
                 session_id += 1;
                 let _ = events.send(Event::Connected {
                     pool: idx,
                     url: url.clone(),
                     session: session_id,
+                    tls: link.tls.is_some(),
                 });
                 let started = Instant::now();
                 let probe = on_backup_since.map(|t| Probe {
                     url: cfg.pools[0].host_port().to_string(),
                     from: t + cfg.primary_retry,
                 });
-                let end = session(&cfg, pool, stream, session_id, probe, &rx, &tx, &events);
+                let end = session(&cfg, pool, link, session_id, probe, &rx, &tx, &events);
                 Ok((end, started.elapsed()))
             }
         };
