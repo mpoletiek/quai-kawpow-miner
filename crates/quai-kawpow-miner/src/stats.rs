@@ -264,6 +264,8 @@ pub struct Stats {
     pub gpu_errors: AtomicU64,
     /// GPU solutions dropped because the CPU check fell behind.
     pub dropped: AtomicU64,
+    /// Solutions found again after being sent (not sent twice).
+    pub duplicates: AtomicU64,
     /// Connected and authorized.
     pub connected: AtomicBool,
     worker: Mutex<String>,
@@ -297,6 +299,7 @@ impl Stats {
             lost: AtomicU64::new(0),
             gpu_errors: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            duplicates: AtomicU64::new(0),
             connected: AtomicBool::new(false),
             worker: Mutex::new(String::new()),
             payout: Mutex::new(String::new()),
@@ -798,6 +801,7 @@ impl Stats {
                 "lost": self.lost.load(Ordering::Relaxed),
                 "gpu_errors": self.gpu_errors.load(Ordering::Relaxed),
                 "dropped": self.dropped.load(Ordering::Relaxed),
+                "duplicates_not_sent": self.duplicates.load(Ordering::Relaxed),
                 "last_accept_s": lock(&self.last_accept).map(|t| t.elapsed().as_secs()),
                 "last_reject": *lock(&self.last_reject),
                 "avg_latency_ms": avg_lat,

@@ -484,8 +484,15 @@ fn gpu_loop(c: &GpuCtx) -> Result<(), String> {
 /// beyond this many they are dropped and counted.
 const CANDIDATE_QUEUE: usize = 256;
 
+/// Final hashes of recent shares remembered to never send one twice.
+const SENT_REMEMBERED: usize = 4096;
+
 /// The submit thread: rsq-pow checks every solution; mismatches are GPU
-/// bugs and are never submitted.
+/// bugs and are never submitted, and a share already sent is not sent
+/// again. (Quai nodes count a share by its final hash, header and nonce, and
+/// re-send the same work under a new job id after every accepted share: a
+/// miner that searches it again from the same nonce re-finds its own
+/// shares, which the node refuses as duplicates.)
 fn submit_thread(
     rx: Receiver<Candidate>,
     verifier: Arc<Verifier>,
@@ -493,6 +500,8 @@ fn submit_thread(
     stats: Arc<Stats>,
     seq: Arc<AtomicU64>,
 ) {
+    let mut sent: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut order: std::collections::VecDeque<[u8; 32]> = std::collections::VecDeque::new();
     for c in rx {
         let h = verifier.hash(c.work.height, &c.work.header, c.nonce);
         if words_le(&h.mix) != c.mix {
@@ -508,6 +517,16 @@ fn submit_thread(
         // The GPU compares the top 64 bits only.
         if !meets(&h.hash, &c.work.target) {
             continue;
+        }
+        if !sent.insert(h.hash) {
+            stats.duplicates.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        order.push_back(h.hash);
+        if order.len() > SENT_REMEMBERED
+            && let Some(old) = order.pop_front()
+        {
+            sent.remove(&old);
         }
         let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
         stats.share_sent(n, c.gpu);
