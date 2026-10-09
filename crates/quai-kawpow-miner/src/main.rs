@@ -841,7 +841,14 @@ fn mine(
     });
     stop.store(true, Ordering::SeqCst);
     if let Some(h) = tui {
-        let _ = h.join();
+        // A TUI stuck on a dead terminal must not keep the process alive.
+        let until = Instant::now() + Duration::from_secs(5);
+        while !h.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if h.is_finished() {
+            let _ = h.join();
+        }
         // The screen is gone: leave the totals behind.
         println!("{} {}", quai_kawpow_miner::miner::now_hms(), stats.line());
         for l in stats.gpu_lines() {

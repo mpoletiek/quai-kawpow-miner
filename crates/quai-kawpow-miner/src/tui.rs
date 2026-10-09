@@ -114,11 +114,35 @@ struct UiState {
     quit_armed: Option<Instant>,
 }
 
+/// Whether the terminal is gone (its window or SSH session closed): the
+/// tty then reads as end-of-file forever, and crossterm's `read` would spin
+/// on it without returning.
+fn terminal_gone() -> bool {
+    let mut p = libc::pollfd {
+        fd: 0,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, no wait.
+    let n = unsafe { libc::poll(&mut p, 1, 0) };
+    n < 0 || p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
 fn ui_loop(mut term: Terminal<CrosstermBackend<Stdout>>, stats: &Stats, stop: &AtomicBool) {
     let mut ui = UiState::default();
     let mut last_draw = Instant::now() - Duration::from_secs(10);
     let mut dirty = true;
     while !stop.load(Ordering::SeqCst) {
+        // A lost terminal stops the miner, as Ctrl-C would (SIGHUP does too,
+        // but the input reader must not be touched once the tty is gone).
+        if terminal_gone() {
+            crate::output::event(format!(
+                "{} the terminal closed; stopping",
+                crate::miner::now_hms()
+            ));
+            stop.store(true, Ordering::SeqCst);
+            return;
+        }
         if dirty || last_draw.elapsed() >= Duration::from_secs(1) {
             let view = stats.view();
             let log = crate::output::recent();
@@ -158,6 +182,9 @@ fn ui_loop(mut term: Terminal<CrosstermBackend<Stdout>>, stats: &Stats, stop: &A
             KeyCode::End => ui.scroll = 0,
             _ => {}
         }
+    }
+    if terminal_gone() {
+        return;
     }
     // One last frame so the screen shows the miner stopping.
     let view = stats.view();
