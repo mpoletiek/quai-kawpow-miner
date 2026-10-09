@@ -251,7 +251,33 @@ Requests are capped at 8 KiB and 2 s each; there is no CORS header.
 
 ## Benchmarks
 
-<!-- BENCHMARKS -->
+Measured 2026-10-09 on an Octominer X12 Ultra, six RTX 3060 Ti at a 200 W
+power limit each (clocks unlocked, driver 595.99, epoch 609), mining Quai
+mainnet through rs-quai's stratum at the node's minimum difficulty (0.1),
+one miner at a time, 15 minutes each after 90 s of warm-up.
+
+| Miner | Version | Hashrate (own report) | Refused by the node | Dev fee | Effective |
+|---|---|---|---|---|---|
+| **quai-kawpow-miner** | 0.1.0 | 186.0 MH/s (two runs: 186.0, 185.7) | 0 | 0% | **186.0 MH/s** |
+| Rigel | 1.23.2 | 187.0 MH/s | 0 | 1% | 185.1 MH/s |
+| SRBMiner-MULTI | 3.7.3 | 181.7 MH/s | 0 | 0.85% | 180.2 MH/s |
+| T-Rex | 0.26.8 | 190.7 MH/s | 11% (duplicate shares) | 1% | 168 MH/s |
+| kawpowminer | 1.2.4 | 187.4 MH/s | 11% (duplicate shares) | 0% | 166 MH/s |
+
+- Power-bound at the same 200 W (1,199 W for the six), the kernels are
+  within 2.5% of each other. T-Rex's is the fastest raw; quai-kawpow-miner
+  ties Rigel and is 2.3% ahead of SRBMiner.
+- T-Rex and kawpowminer lose 11% of their shares on a Quai node: the node
+  re-sends the same work under a new job id after every accepted share,
+  and they search it again from the same nonce, so the node refuses what
+  they find again as duplicates. This miner starts every job at a random
+  nonce and never sends a share twice.
+- The node's own count of valid shares agrees within its statistical error
+  (about 5% at this share rate): 206 +/- 10 and 194 +/- 10 MH/s for this
+  miner's two runs, 193 +/- 10 for Rigel, 175 +/- 9 for SRBMiner.
+- Kernel launch settings (block 128/256/512, grid, streams, DAG load path,
+  occupancy, unrolling) change the hashrate by at most 1-2% under a power
+  cap, and no setting wins at every power limit; the defaults stay.
 
 ## Correctness
 
