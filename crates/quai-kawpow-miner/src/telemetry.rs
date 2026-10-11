@@ -61,7 +61,7 @@ impl Telemetry {
 
 /// Short names for the reasons the clocks are held down (idle and the
 /// application/user clock settings are left out: they are not slowdowns).
-fn throttle_names(r: ThrottleReasons) -> Vec<&'static str> {
+fn throttle_names(r: ThrottleReasons) -> Vec<std::borrow::Cow<'static, str>> {
     [
         (ThrottleReasons::SW_POWER_CAP, "power cap"),
         (ThrottleReasons::HW_SLOWDOWN, "HW slowdown"),
@@ -72,6 +72,6 @@ fn throttle_names(r: ThrottleReasons) -> Vec<&'static str> {
     ]
     .into_iter()
     .filter(|(b, _)| r.contains(*b))
-    .map(|(_, n)| n)
+    .map(|(_, n)| n.into())
     .collect()
 }

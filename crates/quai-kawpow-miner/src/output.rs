@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// Log lines the TUI keeps for its log pane.
+/// Log lines kept for the TUI's log pane and `watch` (the API's `/view`).
 const KEEP: usize = 1000;
 /// Log file size that triggers a rotation.
 pub const ROTATE_AT: u64 = 50 << 20;
@@ -118,14 +118,13 @@ pub fn event(line: String) {
         return;
     };
     to_file(o, &line);
-    if o.tui.load(Ordering::SeqCst) {
-        let mut l = lock(&o.lines);
-        l.push_back(line);
-        while l.len() > KEEP {
-            l.pop_front();
-        }
-    } else {
+    if !o.tui.load(Ordering::SeqCst) {
         println!("{line}");
+    }
+    let mut l = lock(&o.lines);
+    l.push_back(line);
+    while l.len() > KEEP {
+        l.pop_front();
     }
 }
 

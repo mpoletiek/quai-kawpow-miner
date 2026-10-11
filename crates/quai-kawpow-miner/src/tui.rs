@@ -7,6 +7,9 @@
 //! Keys: `q` twice (or Ctrl-C) quits; arrows, PgUp/PgDn and Home/End scroll
 //! the log (End follows it again).
 //!
+//! [`watch`] draws the same screen for a miner running elsewhere (under
+//! systemd, say), from its API's `/view`; quitting it leaves the miner be.
+//!
 //! While the TUI is up, stderr goes to the log file (or /dev/null) so that
 //! nothing writes over the screen.
 
@@ -29,6 +32,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Sparkline, Table};
 use ratatui::Frame;
 
+use crate::api::fetch_screen;
 use crate::stats::{GpuState, GpuView, Stats, View};
 
 /// The saved stderr while it is redirected (-1 when it is not).
@@ -71,13 +75,8 @@ fn restore_terminal() {
     restore_stderr();
 }
 
-/// Takes over the terminal and draws until `stop` is set; `q` twice or
-/// Ctrl-C sets it. `log_file` receives stderr meanwhile.
-pub fn start(
-    stats: Arc<Stats>,
-    stop: Arc<AtomicBool>,
-    log_file: Option<&Path>,
-) -> io::Result<JoinHandle<()>> {
+/// Raw mode, the alternate screen, and a panic hook that undoes them.
+fn enter() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     terminal::enable_raw_mode()?;
     if let Err(e) = execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide) {
         let _ = terminal::disable_raw_mode();
@@ -96,13 +95,48 @@ pub fn start(
         restore_terminal();
         hook(info);
     }));
+    Ok(term)
+}
+
+/// Takes over the terminal and draws until `stop` is set; `q` twice or
+/// Ctrl-C sets it. `log_file` receives stderr meanwhile.
+pub fn start(
+    stats: Arc<Stats>,
+    stop: Arc<AtomicBool>,
+    log_file: Option<&Path>,
+) -> io::Result<JoinHandle<()>> {
+    let term = enter()?;
     redirect_stderr(log_file);
     std::thread::Builder::new()
         .name("tui".into())
         .spawn(move || {
-            ui_loop(term, &stats, &stop);
+            ui_loop(term, &Feed::Local(&stats), &stop);
             restore_terminal();
         })
+}
+
+/// Shows the miner whose API is at `addr` (`host:port`) until `q` or
+/// Ctrl-C; the miner keeps running.
+pub fn watch(addr: &str) -> io::Result<()> {
+    // Fail plainly, before the screen, when nothing answers at all.
+    if let Err(e) = fetch_screen(addr, Duration::from_secs(3)) {
+        return Err(io::Error::other(format!(
+            "cannot read the miner's screen: {e} (is the miner running, with api set?)"
+        )));
+    }
+    let term = enter()?;
+    redirect_stderr(None);
+    ui_loop(term, &Feed::Remote(addr), &AtomicBool::new(false));
+    restore_terminal();
+    Ok(())
+}
+
+/// Where the screen comes from.
+enum Feed<'a> {
+    /// The miner in this process (`q` twice stops it).
+    Local(&'a Stats),
+    /// A miner's API (`watch`: `q` quits the screen only).
+    Remote(&'a str),
 }
 
 /// What the keys changed.
@@ -112,6 +146,12 @@ struct UiState {
     scroll: usize,
     /// When `q` was pressed once (a second press within 3 s quits).
     quit_armed: Option<Instant>,
+    /// `watch`: the API's address.
+    watching: Option<String>,
+    /// `watch`: the last read failure, and when the screen last updated.
+    unreachable: Option<String>,
+    /// See `unreachable`.
+    updated: Option<Instant>,
 }
 
 /// Whether the terminal is gone (its window or SSH session closed): the
@@ -128,28 +168,59 @@ fn terminal_gone() -> bool {
     n < 0 || p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
-fn ui_loop(mut term: Terminal<CrosstermBackend<Stdout>>, stats: &Stats, stop: &AtomicBool) {
-    let mut ui = UiState::default();
+/// The screen's contents now: from the stats, or read from the API (on
+/// failure the last ones stay, and `ui` says why).
+fn refresh(feed: &Feed, ui: &mut UiState, screen: &mut (View, Vec<String>)) {
+    match feed {
+        Feed::Local(stats) => *screen = (stats.view(), crate::output::recent()),
+        Feed::Remote(addr) => match fetch_screen(addr, Duration::from_secs(2)) {
+            Ok(s) => {
+                *screen = (s.view, s.log);
+                ui.unreachable = None;
+                ui.updated = Some(Instant::now());
+            }
+            Err(e) => ui.unreachable = Some(e),
+        },
+    }
+}
+
+fn ui_loop(mut term: Terminal<CrosstermBackend<Stdout>>, feed: &Feed, stop: &AtomicBool) {
+    let watching = matches!(feed, Feed::Remote(_));
+    let mut ui = UiState {
+        watching: match feed {
+            Feed::Remote(a) => Some((*a).to_string()),
+            Feed::Local(_) => None,
+        },
+        ..UiState::default()
+    };
+    let mut screen = (View::default(), Vec::new());
     let mut last_draw = Instant::now() - Duration::from_secs(10);
+    let mut last_read = last_draw;
     let mut dirty = true;
     while !stop.load(Ordering::SeqCst) {
         // A lost terminal stops the miner, as Ctrl-C would (SIGHUP does too,
-        // but the input reader must not be touched once the tty is gone).
+        // but the input reader must not be touched once the tty is gone);
+        // `watch` just ends.
         if terminal_gone() {
-            crate::output::event(format!(
-                "{} the terminal closed; stopping",
-                crate::miner::now_hms()
-            ));
+            if !watching {
+                crate::output::event(format!(
+                    "{} the terminal closed; stopping",
+                    crate::miner::now_hms()
+                ));
+            }
             stop.store(true, Ordering::SeqCst);
             return;
         }
         if dirty || last_draw.elapsed() >= Duration::from_secs(1) {
-            let view = stats.view();
-            let log = crate::output::recent();
+            // Keys redraw at once; the API is read once a second.
+            if !watching || last_read.elapsed() >= Duration::from_secs(1) {
+                refresh(feed, &mut ui, &mut screen);
+                last_read = Instant::now();
+            }
             if ui.quit_armed.is_some_and(|t| t.elapsed() > Duration::from_secs(3)) {
                 ui.quit_armed = None;
             }
-            let _ = term.draw(|f| draw(f, &view, &log, &ui));
+            let _ = term.draw(|f| draw(f, &screen.0, &screen.1, &ui));
             last_draw = Instant::now();
             dirty = false;
         }
@@ -167,7 +238,7 @@ fn ui_loop(mut term: Terminal<CrosstermBackend<Stdout>>, stats: &Stats, stop: &A
                 stop.store(true, Ordering::SeqCst);
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => {
-                if ui.quit_armed.is_some() {
+                if watching || ui.quit_armed.is_some() {
                     stop.store(true, Ordering::SeqCst);
                 } else {
                     ui.quit_armed = Some(Instant::now());
@@ -183,13 +254,12 @@ fn ui_loop(mut term: Terminal<CrosstermBackend<Stdout>>, stats: &Stats, stop: &A
             _ => {}
         }
     }
-    if terminal_gone() {
+    if terminal_gone() || watching {
         return;
     }
     // One last frame so the screen shows the miner stopping.
-    let view = stats.view();
-    let log = crate::output::recent();
-    let _ = term.draw(|f| draw(f, &view, &log, &ui));
+    refresh(feed, &mut ui, &mut screen);
+    let _ = term.draw(|f| draw(f, &screen.0, &screen.1, &ui));
 }
 
 // ---- formatting ----
@@ -531,7 +601,7 @@ fn gpu_cells(g: &GpuView, connected: bool) -> Vec<Cell<'static>> {
                 if r.throttle.is_empty() {
                     Cell::from("")
                 } else {
-                    let serious = r.throttle.iter().any(|t| *t != "power cap");
+                    let serious = r.throttle.iter().any(|t| t != "power cap");
                     let c = Cell::from(r.throttle.join(", "));
                     if serious { c.red().bold() } else { c.style(dim()) }
                 }
@@ -636,7 +706,23 @@ fn draw_log(f: &mut Frame, area: Rect, log: &[String], scroll: usize) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, ui: &UiState) {
-    let line = if ui.quit_armed.is_some() {
+    let line = if let Some(e) = &ui.unreachable {
+        let since = ui
+            .updated
+            .map_or_else(|| "never".to_string(), |t| format!("{} ago", age(t.elapsed())));
+        Line::from(format!(" {e}; retrying (last update {since}) ").bold().white().on_red())
+    } else if let Some(addr) = &ui.watching {
+        Line::from(vec![
+            Span::raw(format!(" watching {addr}   ")),
+            Span::raw("q").bold(),
+            Span::raw(" quit (the miner keeps running)   "),
+            Span::raw("↑↓ PgUp PgDn Home").bold(),
+            Span::raw(" scroll log   "),
+            Span::raw("End").bold(),
+            Span::raw(" follow"),
+        ])
+        .style(dim())
+    } else if ui.quit_armed.is_some() {
         Line::from(" Press q again to stop the miner (Esc cancels) ".bold().black().on_yellow())
     } else {
         Line::from(vec![
@@ -694,7 +780,7 @@ mod tests {
                         util_pct: Some(100),
                         vram: Some((6_300 << 20, 8_192 << 20)),
                         pstate: Some(2),
-                        throttle: vec!["power cap"],
+                        throttle: vec!["power cap".into()],
                         pcie: Some((1, 1)),
                     },
                 })
@@ -704,12 +790,16 @@ mod tests {
     }
 
     fn render(v: &View, w: u16, h: u16) -> String {
+        render_with(v, w, h, &UiState::default())
+    }
+
+    fn render_with(v: &View, w: u16, h: u16, ui: &UiState) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         let log = vec![
             "19:16:43 share 34 from gpu3 accepted (14 ms)  A34".to_string(),
             "19:17:02 gpu0: epoch 609: DAG 5.76 GiB built in 10.0 s".to_string(),
         ];
-        t.draw(|f| draw(f, v, &log, &UiState::default())).unwrap();
+        t.draw(|f| draw(f, v, &log, ui)).unwrap();
         let buf = t.backend().buffer().clone();
         (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
@@ -740,6 +830,22 @@ mod tests {
             assert!(s.contains(want), "missing {want:?} in\n{s}");
         }
         assert!(!s.contains("PCIe"), "a low-priority column on 80 columns:\n{s}");
+    }
+
+    #[test]
+    fn watch_footers() {
+        let mut ui = UiState {
+            watching: Some("10.0.0.14:4073".into()),
+            ..UiState::default()
+        };
+        let s = render_with(&view(2), 160, 30, &ui);
+        assert!(s.contains("watching 10.0.0.14:4073") && s.contains("the miner keeps running"), "{s}");
+        ui.unreachable = Some("10.0.0.14:4073: Connection refused".into());
+        ui.updated = Some(Instant::now() - Duration::from_secs(75));
+        let s = render_with(&view(2), 160, 30, &ui);
+        assert!(s.contains("Connection refused; retrying (last update 1m15s ago)"), "{s}");
+        // The last screen read stays up meanwhile.
+        assert!(s.contains("145.60 MH/s"), "{s}");
     }
 
     #[test]

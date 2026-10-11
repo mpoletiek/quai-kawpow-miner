@@ -215,7 +215,10 @@ can compare it with the proxy's and pin it. The miner keeps retrying, as it
 would for a refused connection. TLS is rustls (TLS 1.2 and 1.3), with no
 OpenSSL needed.
 
-Other commands: `devices` (CUDA and NVML's view), `tune` (below), `verify`
+`mine --check` checks the settings (pools, addresses, token file, TLS,
+hooks, GPU settings) and exits, 0 or 2, without touching a GPU.
+
+Other commands: `watch` (below), `devices` (CUDA and NVML's view), `tune` (below), `verify`
 (the GPU against the CPU reference, nonce by nonce), `bench` (hashrate, with sweeps
 of the launch geometry: `bench --block 128,256 --grid 256,1824 --streams
 2,3`), `compile` and `kernel` (the generated CUDA source).
@@ -259,15 +262,35 @@ To mine from boot as a systemd service:
 `/etc/quai-kawpow-miner/miner.toml` (an installed one is replaced only by
 `--config`, keeping a `.bak`), the token readable by root and the miner's
 user only (point `auth_token_file` at `/etc/quai-kawpow-miner/stratum-token`),
-creates the user (`miner`, or `--user NAME`) when missing, and enables
-`dist/quai-kawpow-miner.service`. Run it again to upgrade; it stops and
-restarts a running miner. Without `--config` on a first install it puts
-the example in place and leaves the miner stopped for you to edit it.
+creates the user (`miner`, or `--user NAME`) when missing, and installs
+`dist/quai-kawpow-miner.service`. It then checks the config as that user
+(`mine --check`, so an unreadable token shows up now, not at boot) and
+enables the service only when it passes; otherwise it says why and exits
+2. Run it again to upgrade; it stops and restarts a running miner. On a
+first install without `--config` it puts the example in place, which fails
+the check until you edit it.
+
+To remove it:
+
+    sudo /usr/local/share/quai-kawpow-miner/uninstall.sh [--purge] [--remove-user]
+
+It stops and disables the service, puts the GPUs' power limits, clocks and
+fans back to their defaults, and removes the unit and the binary. It keeps
+the config, the token and the logs unless `--purge` (which asks first, or
+takes `--yes`), and deletes the user only with `--remove-user` and only if
+`install.sh` created it.
 
 The service turns on persistence mode, applies `[tune]` as root, then
 mines as the user (`--no-tui`); `log_file` can go to
-`/var/log/quai-kawpow-miner/`. Follow it with `journalctl -fu
-quai-kawpow-miner`, the log file, or the API. `systemctl stop` stops it
+`/var/log/quai-kawpow-miner/`. To see it as `mine` would show it:
+
+    quai-kawpow-miner watch --config /etc/quai-kawpow-miner/miner.toml
+
+`watch` draws the full screen from the miner's API (`api` in the config, or
+`--api HOST:PORT`; default 127.0.0.1:4073), once a second; `q` closes it and
+the miner keeps running. When the miner restarts, it says so at the bottom
+and picks it up again. `journalctl -fu quai-kawpow-miner` and the log file
+work too. `systemctl stop` stops it
 cleanly (it waits for the GPUs and the last hook events); a crash or a
 run-time failure restarts it after 10 s, for as long as it takes. Exit
 codes:
@@ -363,7 +386,9 @@ as its host only. A hook that fails is logged, and mining goes on.
 - `GET /metrics`: Prometheus (`qkm_hashrate_hashes_per_second`,
   `qkm_shares_total{result=...}`, `qkm_gpu_temperature_celsius{device,bus,name}`
   and so on);
-- `GET /health`: `ok`.
+- `GET /health`: `ok`;
+- `GET /view`: what the full screen shows, with the last 1000 log lines
+  (for `watch`).
 
 Requests are capped at 8 KiB and 2 s each; there is no CORS header.
 

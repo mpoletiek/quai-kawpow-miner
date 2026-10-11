@@ -12,7 +12,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// What the GPU is doing.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum GpuState {
     /// Waiting for work.
     #[default]
@@ -30,7 +30,7 @@ pub enum GpuState {
 }
 
 /// Telemetry of one device (NVML).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceReading {
     /// Celsius.
     pub temperature_c: Option<u32>,
@@ -51,7 +51,7 @@ pub struct DeviceReading {
     /// Performance state (0 = P0).
     pub pstate: Option<u32>,
     /// Why the clocks are held down now (short names, e.g. "power cap").
-    pub throttle: Vec<&'static str>,
+    pub throttle: Vec<std::borrow::Cow<'static, str>>,
     /// PCIe link generation and width.
     pub pcie: Option<(u32, u32)>,
 }
@@ -120,7 +120,7 @@ fn reading_text(r: &DeviceReading) -> String {
 }
 
 /// One GPU in a [`View`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct GpuView {
     /// CUDA device index.
     pub device: usize,
@@ -144,8 +144,9 @@ pub struct GpuView {
     pub reading: DeviceReading,
 }
 
-/// A snapshot of the stats (see [`Stats::view`]).
-#[derive(Clone, Debug, Default)]
+/// A snapshot of the stats (see [`Stats::view`]); the API serves it, with
+/// the log, on `/view` for `watch`.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct View {
     /// Since start.
     pub uptime: Duration,

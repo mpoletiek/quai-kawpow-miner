@@ -154,6 +154,11 @@ enum Cmd {
         /// ntfy, your own).
         #[arg(long, value_name = "URL")]
         hook_url: Option<String>,
+        /// Check the settings (pools, logins, token file, TLS, hooks, GPU
+        /// settings) and exit, without touching a GPU: 0 when they are
+        /// good, 2 when not.
+        #[arg(long)]
+        check: bool,
         #[command(flatten)]
         tls: TlsArgs,
         #[command(flatten)]
@@ -161,6 +166,17 @@ enum Cmd {
     },
     /// List the CUDA devices (index, PCI bus, name, memory, power limit).
     Devices,
+    /// Show a running miner's full screen (one run as a service, say) from
+    /// its API; quitting leaves the miner running.
+    Watch {
+        /// The miner's API address (default: `api` from --config, else
+        /// 127.0.0.1:4073).
+        #[arg(long, value_name = "HOST:PORT")]
+        api: Option<String>,
+        /// Take the address from this configuration's `api`.
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+    },
     /// Apply GPU settings (power limit, clocks, fans) and exit; needs root.
     /// Takes the same settings as `mine` (flags or the config's `[tune]`).
     Tune {
@@ -718,6 +734,21 @@ struct FilePool {
     tls_ca: Option<std::path::PathBuf>,
 }
 
+/// Where `watch` reads the screen: the configured API address (a wildcard
+/// one, e.g. 0.0.0.0, through the loopback), or the usual 127.0.0.1:4073.
+fn watch_address(api: Option<std::net::SocketAddr>) -> String {
+    let Some(mut a) = api else {
+        return "127.0.0.1:4073".into();
+    };
+    if a.ip().is_unspecified() {
+        a.set_ip(match a.ip() {
+            std::net::IpAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+            std::net::IpAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    a.to_string()
+}
+
 /// The `[hooks]` section.
 #[derive(serde::Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -934,6 +965,7 @@ fn mine(
     log_file: Option<std::path::PathBuf>,
     hook_command: Option<std::path::PathBuf>,
     hook_url: Option<String>,
+    check: bool,
     tls_args: TlsArgs,
     tune: Tuning,
 ) -> Result<(), CliError> {
@@ -1005,9 +1037,7 @@ fn mine(
     if pool_list.is_empty() {
         return Err("no pool: give --pool or a [[pool]] in --config".into());
     }
-    qkm_cuda::libraries().map_err(|e| e.to_string())?;
     let mut cfg = MinerConfig::new(pool_list);
-    cfg.devices = mine_devices(devices.as_deref(), device, &file)?;
     cfg.status_every = Duration::from_secs(status_secs.or(file.status_secs).unwrap_or(30).max(1));
     cfg.dag_prefetch = !no_dag_prefetch && file.dag_prefetch.unwrap_or(true);
     let stagger = start_stagger.or(file.start_stagger).unwrap_or(5.0);
@@ -1029,6 +1059,18 @@ fn mine(
     cfg.tune = file.tune.with(&tune);
     cfg.hooks = hooks_config(file.hooks.as_ref(), hook_command, hook_url)?;
     cfg.tune.check()?;
+    if check {
+        for n in &notes {
+            println!("{n}");
+        }
+        if !cfg.hooks.is_off() {
+            println!("{}", cfg.hooks.describe());
+        }
+        println!("configuration OK");
+        return Ok(());
+    }
+    qkm_cuda::libraries().map_err(|e| e.to_string())?;
+    cfg.devices = mine_devices(devices.as_deref(), device, &file)?;
     let stats = Arc::new(Stats::new(&cfg.devices));
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
@@ -1309,6 +1351,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             log_file,
             hook_command,
             hook_url,
+            check,
             tls,
             tune: t,
         } => return mine(
@@ -1331,10 +1374,18 @@ fn run(cli: Cli) -> Result<(), CliError> {
             log_file,
             hook_command,
             hook_url,
+            check,
             tls,
             t.tuning(),
         ),
         Cmd::Devices => list_devices(),
+        Cmd::Watch { api, config } => {
+            let addr = match api {
+                Some(a) => a,
+                None => watch_address(read_config(config.as_deref())?.api),
+            };
+            quai_kawpow_miner::tui::watch(&addr).map_err(|e| e.to_string())
+        }
         Cmd::Tune {
             devices,
             config,
@@ -1559,6 +1610,14 @@ mod tests {
         assert!(bad("[hooks]\nwebhook = \"http://x\"\nformat = \"xml\"").contains("json or text"));
         assert!(bad("[hooks]\nwebhook = \"http://x\"\nhashrate_low_mins = 3").contains("needs"));
         assert!(toml::from_str::<FileConfig>("[hooks]\ncomand = \"/x\"").is_err());
+    }
+
+    #[test]
+    fn watch_addresses() {
+        assert_eq!(watch_address(None), "127.0.0.1:4073");
+        assert_eq!(watch_address(Some("10.0.0.14:4080".parse().unwrap())), "10.0.0.14:4080");
+        assert_eq!(watch_address(Some("0.0.0.0:4073".parse().unwrap())), "127.0.0.1:4073");
+        assert_eq!(watch_address(Some("[::]:4073".parse().unwrap())), "[::1]:4073");
     }
 
     #[test]

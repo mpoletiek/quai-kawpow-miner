@@ -6,8 +6,9 @@
 #   sudo install -D -m 0644 miner.toml /etc/quai-kawpow-miner/miner.toml
 #   sudo cp quai-kawpow-miner.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now quai-kawpow-miner
-# Follow it with: journalctl -fu quai-kawpow-miner (or the log file), and
-# the API (curl localhost:4073) when `api` is set.
+# Watch it with: quai-kawpow-miner watch --config /etc/quai-kawpow-miner/miner.toml
+# (the full screen, from the API: set `api`), or journalctl -fu quai-kawpow-miner.
+# Remove it with: sudo /usr/local/share/quai-kawpow-miner/uninstall.sh
 [Unit]
 Description=quai-kawpow-miner (KawPoW GPU miner for Quai Network)
 Documentation=https://github.com/mpoletiek/quai-kawpow-miner
