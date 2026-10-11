@@ -250,8 +250,27 @@ file's text.
 
 ## Running unattended
 
-`dist/quai-kawpow-miner.service` runs the miner under systemd
-(`--no-tui`, restarted on failure). Exit codes:
+To mine from boot as a systemd service:
+
+    cargo build --release
+    sudo dist/install.sh --config miner.toml --token ~/.config/quai/stratum-token --start
+
+`install.sh` puts the binary in `/usr/local/bin`, the config in
+`/etc/quai-kawpow-miner/miner.toml` (an installed one is replaced only by
+`--config`, keeping a `.bak`), the token readable by root and the miner's
+user only (point `auth_token_file` at `/etc/quai-kawpow-miner/stratum-token`),
+creates the user (`miner`, or `--user NAME`) when missing, and enables
+`dist/quai-kawpow-miner.service`. Run it again to upgrade; it stops and
+restarts a running miner. Without `--config` on a first install it puts
+the example in place and leaves the miner stopped for you to edit it.
+
+The service turns on persistence mode, applies `[tune]` as root, then
+mines as the user (`--no-tui`); `log_file` can go to
+`/var/log/quai-kawpow-miner/`. Follow it with `journalctl -fu
+quai-kawpow-miner`, the log file, or the API. `systemctl stop` stops it
+cleanly (it waits for the GPUs and the last hook events); a crash or a
+run-time failure restarts it after 10 s, for as long as it takes. Exit
+codes:
 
 | Code | Meaning | Restart? |
 |---|---|---|
