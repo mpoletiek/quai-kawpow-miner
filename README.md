@@ -43,6 +43,19 @@ Requirements: an NVIDIA driver (Linux), and NVRTC from the CUDA toolkit
 toolkit's `lib64` on `LD_LIBRARY_PATH`). The miner says so when either is
 missing.
 
+From a release: the Linux x86-64 build runs on glibc 2.28 and later
+(Ubuntu 20.04+, Debian 10+, RHEL 8+, HiveOS):
+
+    tar -xzf quai-kawpow-miner-0.1.0-linux-x86_64.tar.gz
+    cd quai-kawpow-miner-0.1.0-linux-x86_64
+    sha256sum -c ../SHA256SUMS --ignore-missing   # from the release page
+    # Try it (below), or install it as a service that mines from boot
+    # (see Running unattended; in the release, install.sh is next to the
+    # binary rather than in dist/):
+    sudo ./install.sh --config miner.toml --token stratum-token --start
+
+From the source:
+
     cargo build --release      # target/release/quai-kawpow-miner
 
     quai-kawpow-miner devices  # what CUDA and NVML see
