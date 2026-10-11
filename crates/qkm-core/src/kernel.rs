@@ -5,6 +5,27 @@
 //! 16 threads (the ProgPoW lanes) computes the hashes of its 16 nonces one
 //! after another, each thread holding one lane's 32 registers, with the
 //! first 16 KiB of the DAG in shared memory.
+//!
+//! Where it stands (RTX 3060 Ti GDDR6X, epoch 610, 2026-10-11): memory runs
+//! at 9251 MHz under CUDA (P2), about 592 GB/s, and every hash reads 16 KiB
+//! of DAG. At 225 W the kernel moves 93-94% of that (34 MH/s); at 200 W,
+//! 90% (32 MH/s, 161 kH/W, the most efficient point), held there by the
+//! power cap. Nsight Compute: 60% of stalls wait on the DAG load; 78-80
+//! registers in most periods, 3 blocks (24 warps) per SM, which shared
+//! memory (16 KiB a block) limits as much as registers. T-Rex 0.26.8's
+//! benchmark on the same card ties at 200 W and reports 1.4% more at 225 W
+//! (its own figure: it refuses the profiler). Measured and no faster, each
+//! within noise or 0.5-6% slower, at 200 W and 225 W:
+//! - without the fence (64 registers, 5 fewer instructions an iteration),
+//!   and unrolled 2 to 16 (down to 126 instructions an iteration): the DAG
+//!   load then issues 16-65 instructions before its use instead of 121;
+//! - more warps: a 64-register cap, blocks of 512 or 1024;
+//! - each hash's first DAG load issued before the previous digest and
+//!   `fill_mix` (exact, 72 registers, 1% slower);
+//! - grids of 228 to 3648 blocks, 2 or 3 streams; `ldg`, `cg`, `cs` and
+//!   plain loads;
+//! - memory clocks locked at 9501 MHz (P2 keeps 9251; 6% slower at 225 W)
+//!   or +500 MHz offset (9501 MHz, no faster: the memory takes the power).
 
 use std::fmt::Write;
 
