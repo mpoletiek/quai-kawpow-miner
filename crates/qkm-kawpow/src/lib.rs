@@ -2,7 +2,7 @@
 //! generates its kernels from: ProgPoW with Ravencoin's Keccak-f800
 //! padding, the ethash light cache and cDag, and light (CPU) evaluation.
 //!
-//! Ported from [rs-quai](https://github.com/mpoletiek/rs-quai)'s `rsq-pow`
+//! Ported from rs-quai's `rsq-pow`
 //! (`common.rs`, `epoch_cache.rs`, `kawpow.rs`, at dbd388d), itself a port
 //! of go-quai v0.56.0's `consensus/kawpow` and `consensus/progpow`, and
 //! verified there against go-quai across the mainnet chain. Only the

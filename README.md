@@ -8,12 +8,11 @@ donor header that commits to a Quai block, through a Quai node's stratum
 (rs-quai, or go-quai 0.56 and later). This miner is built for that setup:
 
 - **The node's own algorithm.** KawPoW comes from `crates/qkm-kawpow`,
-  ported from [rs-quai](https://github.com/mpoletiek/rs-quai)'s `rsq-pow`,
-  which is verified against go-quai across the whole mainnet chain; it
-  passes go-quai's Ravencoin block vectors. The GPU kernels are generated
-  from the same code, and every share is checked on the CPU before it is
-  sent, so the miner never submits a bad share. The miner builds on its
-  own: no dependency on rs-quai.
+  ported from rs-quai's `rsq-pow`, which is verified against go-quai
+  across the whole mainnet chain; it passes go-quai's Ravencoin block
+  vectors. The GPU kernels are generated from the same code, and every
+  share is checked on the CPU before it is sent, so the miner never submits
+  a bad share. The miner builds on its own: no dependency on rs-quai.
 - **Quai, done right.** The payout address is checked (40 hex digits, its
   zone) and the miner says where the rewards go: the Quai or the Qi ledger,
   which zone, and the coinbase lockup (`--lock 0..3`, with its reward
