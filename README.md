@@ -408,8 +408,13 @@ one miner at a time, 15 minutes each after 90 s of warm-up.
 | kawpowminer | 1.2.4 | 187.4 MH/s | 11% (duplicate shares) | 0% | 166 MH/s |
 
 - Power-bound at the same 200 W (1,199 W for the six), the kernels are
-  within 2.5% of each other. T-Rex's is the fastest raw; quai-kawpow-miner
-  ties Rigel and is 2.3% ahead of SRBMiner.
+  within 2.5% of each other by their own reports; quai-kawpow-miner ties
+  Rigel and is 2.3% ahead of SRBMiner.
+- One card against T-Rex's benchmark mode (2026-10-11, GPU 1 alone, epoch
+  610, two interleaved rounds each): at 200 W they tie (T-Rex 31.91 MH/s,
+  quai-kawpow-miner 31.93); at 225 W T-Rex reports 1.4% more (34.30 against
+  33.84 MH/s). That is T-Rex's own figure: it refuses to run under a
+  profiler, so its work cannot be counted independently.
 - T-Rex and kawpowminer lose 11% of their shares on a Quai node: the node
   re-sends the same work under a new job id after every accepted share,
   and they search it again from the same nonce, so the node refuses what
@@ -418,9 +423,11 @@ one miner at a time, 15 minutes each after 90 s of warm-up.
 - The node's own count of valid shares agrees within its statistical error
   (about 5% at this share rate): 206 +/- 10 and 194 +/- 10 MH/s for this
   miner's two runs, 193 +/- 10 for Rigel, 175 +/- 9 for SRBMiner.
-- Kernel launch settings (block 128/256/512, grid, streams, DAG load path,
-  occupancy, unrolling) change the hashrate by at most 1-2% under a power
-  cap, and no setting wins at every power limit; the defaults stay.
+- The kernel is at the memory's limit: at 225 W it reads 93-94% of the
+  DAG bandwidth the card's CUDA memory clock allows, and at 200 W the power
+  cap holds it at 90%. Launch settings, occupancy, unrolling, the DAG load
+  path and memory clocks change the hashrate by at most 1-2%, and none
+  wins (what was measured is listed in `crates/qkm-core/src/kernel.rs`).
 
 ## Correctness
 
