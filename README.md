@@ -138,6 +138,7 @@ status line instead.
 - `--log-file PATH`: the log and the status lines; it rotates at 50 MiB,
   keeping three old files.
 - `--status-secs N`, `--no-dag-prefetch`, `--no-tui`.
+- `--hook-command PATH`, `--hook-url URL`: event hooks (see below).
 - GPU settings: `--power-limit W`, `--lock-core-clocks MIN,MAX`,
   `--lock-mem-clocks MIN,MAX`, `--core-offset MHZ`, `--mem-offset MHZ`,
   `--fan PCT` (see GPU tuning).
@@ -282,6 +283,57 @@ What it does on its own:
 Octominer rigs: without OctOS or HiveOS nothing feeds the fan board's
 hardware watchdog, and it resets the rig every 25 minutes; run
 [octofan-watchdog](https://github.com/mpoletiek/octofan-watchdog) alongside.
+
+## Event hooks
+
+The miner can tell you when something happens, by running a program and/or
+posting to a webhook (Discord, Slack, ntfy, or your own):
+
+    [hooks]
+    command = "/home/miner/qkm/on-event.sh"   # absolute path
+    webhook = "https://discord.com/api/webhooks/..."
+    #format = "text"            # plain text (ntfy); default json
+    #events = ["default", "share_rejected"]
+    hashrate_low_mhs = 180       # hashrate_low below this...
+    hashrate_low_mins = 5        # ...for this long (default 5)
+    #pool_down_mins = 2          # pool_down after this long with no pool
+    #interval_secs = 60          # folding (below)
+    #timeout_secs = 10           # per delivery
+
+`--hook-command` and `--hook-url` set the first two from the command line.
+
+| Event | When | Default |
+|---|---|---|
+| `miner_stopping` | the miner stops: on request, or why it must | on |
+| `pool_failover` / `pool_primary_back` | to a backup pool, and back to the first | on |
+| `pool_down` / `pool_up` | no usable pool for `pool_down_mins`, and again usable | on |
+| `auth_refused` | a pool refused the address, lock or token | on |
+| `gpu_reset` / `gpu_failed` | a device reset after errors; a GPU given up | on |
+| `gpu_too_hot` | a GPU reached `temp_limit` and paused | on |
+| `hashrate_low` / `hashrate_ok` | the rig's hashrate below `hashrate_low_mhs` for `hashrate_low_mins`, and back | on (with a threshold) |
+| `miner_started`, `pool_connected`, `pool_disconnected`, `share_rejected`, `gpu_error`, `gpu_cooled` | the routine | off |
+
+`events` picks them: names, `all`, or `default` plus more. `share_rejected`
+is a refusal by the pool; stale shares and shares lost with a connection
+are not (the pool events cover those). No hook can say "block found": the
+node answers a block and a workshare the same way.
+
+The program gets the event as `$1`, and in its environment `QKM_EVENT`,
+`QKM_MESSAGE` (one line, e.g. `rig1: gpu3: 91C reached the 90C limit;
+paused until 75C`), `QKM_DETAIL`, `QKM_GPU`, `QKM_GPUS`, `QKM_WORKER`,
+`QKM_HASHRATE_MHS`, `QKM_FOLDED` and `QKM_TIME` (Unix seconds). It runs
+directly, not through a shell, with its output discarded; it is killed
+after `timeout_secs`. The webhook gets a JSON object with the same fields
+(`event`, `message`, `detail`, `gpu`, `gpus`, `worker`, `hashrate_mhs`,
+`folded`, `time`), plus the message as `content` and `text`, which is what
+Discord and Slack show; with `format = "text"` it gets the message alone.
+
+Hooks never slow the miner: events queue for one delivery thread. A burst
+of one event is folded: the first goes out at once, the latest of the rest
+after `interval_secs`, as `... (and 12 more like it, on gpu0 gpu2 gpu5)`.
+What was held back goes out before `miner_stopping`. The auth token is
+never passed on, and the webhook URL (which often holds a secret) is logged
+as its host only. A hook that fails is logged, and mining goes on.
 
 ## API and metrics
 

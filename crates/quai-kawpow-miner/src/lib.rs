@@ -2,6 +2,7 @@
 //! stats, the JSON API, NVML telemetry, GPU tuning and the TUI.
 
 pub mod api;
+pub mod hooks;
 pub mod miner;
 pub mod output;
 pub mod quai;

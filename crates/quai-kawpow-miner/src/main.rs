@@ -84,6 +84,8 @@ impl TuneArgs {
     }
 }
 
+// Parsed once; boxing `Mine`'s flags would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Mine through a Quai node's stratum (rs-quai or go-quai).
@@ -144,6 +146,14 @@ enum Cmd {
         /// Append the log and the status lines to this file.
         #[arg(long, value_name = "PATH")]
         log_file: Option<std::path::PathBuf>,
+        /// Run this program on events (absolute path; see [hooks] in the
+        /// README for the events and its environment).
+        #[arg(long, value_name = "PATH")]
+        hook_command: Option<std::path::PathBuf>,
+        /// POST events to this http:// or https:// URL (Discord, Slack,
+        /// ntfy, your own).
+        #[arg(long, value_name = "URL")]
+        hook_url: Option<String>,
         #[command(flatten)]
         tls: TlsArgs,
         #[command(flatten)]
@@ -689,6 +699,7 @@ struct FileConfig {
     temp_limit: Option<u32>,
     temp_resume: Option<u32>,
     report_hashrate: Option<bool>,
+    hooks: Option<FileHooks>,
     #[serde(default)]
     tune: TuneConfig,
     #[serde(default, rename = "pool")]
@@ -705,6 +716,93 @@ struct FilePool {
     auth_token_file: Option<std::path::PathBuf>,
     tls_fingerprint: Option<String>,
     tls_ca: Option<std::path::PathBuf>,
+}
+
+/// The `[hooks]` section.
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileHooks {
+    command: Option<std::path::PathBuf>,
+    webhook: Option<String>,
+    format: Option<String>,
+    events: Option<Vec<String>>,
+    hashrate_low_mhs: Option<f64>,
+    hashrate_low_mins: Option<f64>,
+    pool_down_mins: Option<f64>,
+    interval_secs: Option<u64>,
+    timeout_secs: Option<u64>,
+}
+
+/// The hook settings from `[hooks]` and the flags (which win).
+fn hooks_config(
+    file: Option<&FileHooks>,
+    command: Option<std::path::PathBuf>,
+    url: Option<String>,
+) -> Result<quai_kawpow_miner::hooks::HooksConfig, String> {
+    use quai_kawpow_miner::hooks::{Format, HooksConfig, LowRate, Webhook, parse_events};
+    let empty = FileHooks::default();
+    let f = file.unwrap_or(&empty);
+    let mut cfg = HooksConfig {
+        command: command.or_else(|| f.command.clone()),
+        ..HooksConfig::default()
+    };
+    if let Some(c) = &cfg.command {
+        if !c.is_absolute() {
+            return Err(format!(
+                "hooks: the command must be an absolute path, not {}",
+                c.display()
+            ));
+        }
+        if !c.is_file() {
+            return Err(format!("hooks: no program at {}", c.display()));
+        }
+    }
+    cfg.webhook = url
+        .or_else(|| f.webhook.clone())
+        .map(|u| Webhook::parse(&u).map_err(|e| format!("hooks: {e}")))
+        .transpose()?;
+    cfg.format = match f.format.as_deref() {
+        None | Some("json") => Format::Json,
+        Some("text") => Format::Text,
+        Some(o) => return Err(format!("hooks: format is json or text, not {o:?}")),
+    };
+    if let Some(e) = &f.events {
+        cfg.events = Some(parse_events(e).map_err(|e| format!("hooks: {e}"))?);
+    }
+    let minutes = |v: f64, what: &str| {
+        if v.is_finite() && v > 0.0 && v <= 1440.0 {
+            Ok(Duration::from_secs_f64(v * 60.0))
+        } else {
+            Err(format!("hooks: {what} must be between 0 and 1440 minutes"))
+        }
+    };
+    if let Some(mhs) = f.hashrate_low_mhs {
+        if !(mhs.is_finite() && mhs > 0.0) {
+            return Err("hooks: hashrate_low_mhs must be above 0".into());
+        }
+        cfg.hashrate_low = Some(LowRate {
+            below: mhs * 1e6,
+            after: minutes(f.hashrate_low_mins.unwrap_or(5.0), "hashrate_low_mins")?,
+        });
+    } else if f.hashrate_low_mins.is_some() {
+        return Err("hooks: hashrate_low_mins needs hashrate_low_mhs".into());
+    }
+    if let Some(m) = f.pool_down_mins {
+        cfg.pool_down_after = minutes(m, "pool_down_mins")?;
+    }
+    if let Some(i) = f.interval_secs {
+        cfg.interval = Duration::from_secs(i);
+    }
+    if let Some(t) = f.timeout_secs {
+        if !(1..=300).contains(&t) {
+            return Err("hooks: timeout_secs must be 1 to 300".into());
+        }
+        cfg.timeout = Duration::from_secs(t);
+    }
+    if cfg.is_off() && file.is_some() {
+        return Err("hooks: give a command or a webhook".into());
+    }
+    Ok(cfg)
 }
 
 /// TLS for `url`: `None` unless it is a `stratum+ssl://` URL, which is
@@ -834,6 +932,8 @@ fn mine(
     report_hashrate: bool,
     no_tui: bool,
     log_file: Option<std::path::PathBuf>,
+    hook_command: Option<std::path::PathBuf>,
+    hook_url: Option<String>,
     tls_args: TlsArgs,
     tune: Tuning,
 ) -> Result<(), CliError> {
@@ -927,6 +1027,7 @@ fn mine(
     }
     cfg.report_hashrate = report_hashrate || file.report_hashrate.unwrap_or(false);
     cfg.tune = file.tune.with(&tune);
+    cfg.hooks = hooks_config(file.hooks.as_ref(), hook_command, hook_url)?;
     cfg.tune.check()?;
     let stats = Arc::new(Stats::new(&cfg.devices));
     let stop = Arc::new(AtomicBool::new(false));
@@ -1206,6 +1307,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             report_hashrate,
             no_tui,
             log_file,
+            hook_command,
+            hook_url,
             tls,
             tune: t,
         } => return mine(
@@ -1226,6 +1329,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             report_hashrate,
             no_tui,
             log_file,
+            hook_command,
+            hook_url,
             tls,
             t.tuning(),
         ),
@@ -1383,6 +1488,77 @@ mod tests {
         assert!(pool_tls("stratum+ssl://n:1", Some(&fp), Some("/x.pem".as_ref())).is_err());
         assert!(pool_tls("stratum+ssl://n:1", None, Some("/nonexistent.pem".as_ref())).is_err());
         assert!(pool_tls("http://node:3333", None, None).is_err());
+    }
+
+    /// The shipped example parses, with and without its comments taken out
+    /// (every commented setting is valid too).
+    #[test]
+    fn example_config_parses() {
+        let text = include_str!("../../../dist/miner.example.toml");
+        let f: FileConfig = toml::from_str(text).unwrap();
+        assert_eq!(f.pools.len(), 1);
+        let uncommented: String = text
+            .lines()
+            .map(|l| {
+                // `#key = value` and `#[section]`, not prose.
+                l.strip_prefix('#')
+                    .filter(|rest| {
+                        rest.starts_with('[')
+                            || rest.split_once(" = ").is_some_and(|(k, _)| {
+                                !k.is_empty()
+                                    && k.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.')
+                            })
+                    })
+                    .unwrap_or(l)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let f: FileConfig = toml::from_str(&uncommented).unwrap();
+        assert_eq!(f.pools.len(), 2);
+        let h = f.hooks.unwrap();
+        assert_eq!(h.hashrate_low_mhs, Some(180.0));
+    }
+
+    #[test]
+    fn hook_settings() {
+        use quai_kawpow_miner::hooks::{Format, Kind};
+        let off = hooks_config(None, None, None).unwrap();
+        assert!(off.is_off());
+        let f: FileConfig = toml::from_str(
+            r#"
+            [hooks]
+            webhook = "https://ntfy.sh/rig"
+            format = "text"
+            events = ["default", "share_rejected"]
+            hashrate_low_mhs = 180
+            pool_down_mins = 3
+            interval_secs = 30
+            "#,
+        )
+        .unwrap();
+        let c = hooks_config(f.hooks.as_ref(), None, None).unwrap();
+        assert_eq!(c.format, Format::Text);
+        assert!(c.wants(Kind::ShareRejected) && c.wants(Kind::GpuFailed));
+        assert!(!c.wants(Kind::PoolConnected));
+        assert_eq!(c.hashrate_low.unwrap().below, 180e6);
+        assert_eq!(c.hashrate_low.unwrap().after, Duration::from_secs(300));
+        assert_eq!(c.pool_down_after, Duration::from_secs(180));
+        assert_eq!(c.interval, Duration::from_secs(30));
+        // The flag wins.
+        let c = hooks_config(f.hooks.as_ref(), None, Some("http://10.0.0.11:9/x".into())).unwrap();
+        assert!(c.describe().contains("http://10.0.0.11/…"), "{}", c.describe());
+        let bad = |t: &str| {
+            let f: FileConfig = toml::from_str(t).unwrap();
+            hooks_config(f.hooks.as_ref(), None, None).unwrap_err()
+        };
+        assert!(bad("[hooks]\nevents = [\"gpu_failed\"]").contains("command or a webhook"));
+        assert!(bad("[hooks]\ncommand = \"rel/x.sh\"").contains("absolute"));
+        assert!(bad("[hooks]\ncommand = \"/nonexistent/x.sh\"").contains("no program"));
+        assert!(bad("[hooks]\nwebhook = \"ftp://x\"").contains("http"));
+        assert!(bad("[hooks]\nwebhook = \"http://x\"\nevents = [\"nope\"]").contains("unknown"));
+        assert!(bad("[hooks]\nwebhook = \"http://x\"\nformat = \"xml\"").contains("json or text"));
+        assert!(bad("[hooks]\nwebhook = \"http://x\"\nhashrate_low_mins = 3").contains("needs"));
+        assert!(toml::from_str::<FileConfig>("[hooks]\ncomand = \"/x\"").is_err());
     }
 
     #[test]

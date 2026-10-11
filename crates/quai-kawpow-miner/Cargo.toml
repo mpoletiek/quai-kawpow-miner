@@ -24,3 +24,8 @@ nvml-wrapper = "0.13"
 ctrlc = { version = "3", features = ["termination"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }

@@ -26,6 +26,15 @@ start_stagger = 5
 # Send the hashrate to the pool every minute (eth_submitHashrate).
 report_hashrate = false
 
+# Event hooks: a program and/or a webhook told when something happens
+# (README: Event hooks).
+#[hooks]
+#command = "/home/miner/qkm/on-event.sh"
+#webhook = "https://ntfy.sh/your-topic"
+#format = "text"
+#hashrate_low_mhs = 180
+#hashrate_low_mins = 5
+
 # GPU settings, applied by `sudo quai-kawpow-miner tune --config <this file>`
 # (and by `mine` when it runs as root).
 [tune]

@@ -27,6 +27,7 @@ use qkm_stratum::{
     Client, Config, Event, Job, Pool, Share, Submitter, difficulty_of_target, redact,
 };
 
+use crate::hooks::{Hooks, HooksConfig, Kind, Note, Watch};
 use crate::stats::{GpuState, Stats};
 use crate::telemetry::Telemetry;
 use crate::tune::TuneConfig;
@@ -64,6 +65,8 @@ pub struct MinerConfig {
     /// stuck (a hung kernel or driver): the miner exits, for a supervisor
     /// to restart it.
     pub stall_timeout: Duration,
+    /// Event hooks (off unless a program or webhook is set).
+    pub hooks: HooksConfig,
 }
 
 impl MinerConfig {
@@ -86,6 +89,7 @@ impl MinerConfig {
             temp_resume: None,
             report_hashrate: false,
             stall_timeout: Duration::from_secs(120),
+            hooks: HooksConfig::default(),
         }
     }
 
@@ -215,6 +219,7 @@ struct GpuCtx {
     candidates: SyncSender<Candidate>,
     stop: Arc<AtomicBool>,
     cfg: MinerConfig,
+    hooks: Hooks,
 }
 
 fn gib(b: u64) -> f64 {
@@ -258,10 +263,17 @@ fn gpu_thread(mut c: GpuCtx) {
         st.set_state(GpuState::Error);
         if failures >= GIVE_UP_AFTER {
             log!("gpu{dev}: GPU error ({failures} in a row): {e}; giving this GPU up");
+            c.hooks.fire(Note::gpu(
+                Kind::GpuFailed,
+                dev,
+                format!("given up after {failures} errors in a row: {e}"),
+            ));
             st.set_state(GpuState::Failed);
             return;
         }
         log!("gpu{dev}: GPU error ({failures}): {e}; retrying");
+        c.hooks
+            .fire(Note::gpu(Kind::GpuError, dev, format!("error {failures}: {e}")));
         if failures >= RESET_AFTER {
             // Everything on the old context was dropped with gpu_loop's
             // state (the DAG built ahead is joined on drop); only this
@@ -270,9 +282,21 @@ fn gpu_thread(mut c: GpuCtx) {
             match qkm_cuda::reset_device(dev).and_then(|()| Gpu::new(dev)) {
                 Ok(g) => {
                     log!("gpu{dev}: device reset");
+                    c.hooks.fire(Note::gpu(
+                        Kind::GpuReset,
+                        dev,
+                        format!("device reset after {failures} errors in a row"),
+                    ));
                     c.gpu = Some(Arc::new(g));
                 }
-                Err(err) => log!("gpu{dev}: device reset failed: {err}"),
+                Err(err) => {
+                    log!("gpu{dev}: device reset failed: {err}");
+                    c.hooks.fire(Note::gpu(
+                        Kind::GpuError,
+                        dev,
+                        format!("device reset failed: {err}"),
+                    ));
+                }
             }
         }
         let wait = Duration::from_secs(u64::from(failures.min(6)) * 5);
@@ -750,6 +774,19 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
             cfg.temp_resume()
         );
     }
+    let user = cfg.pools.first().map_or("", |p| p.user.as_str());
+    let (hooks, hook_runner) = Hooks::start(cfg.hooks.clone(), user, stats.clone());
+    if hook_runner.is_some() {
+        log!("{}", cfg.hooks.describe());
+    }
+    hooks.fire(Note::new(
+        Kind::MinerStarted,
+        format!(
+            "started on {} of {} GPUs",
+            opened.len(),
+            cfg.devices.len()
+        ),
+    ));
     let verifier = Arc::new(Verifier::default());
     let slot = Arc::new(Slot::default());
     let (ev_tx, ev_rx) = channel();
@@ -783,6 +820,7 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
             candidates: cand_tx.clone(),
             stop: stop.clone(),
             cfg: cfg.clone(),
+            hooks: hooks.clone(),
         };
         gpu_handles.push(
             std::thread::Builder::new()
@@ -805,6 +843,7 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
     // The difficulty the share-rate warnings were last checked for.
     let mut warned_for: Option<f64> = None;
     let mining_since = Instant::now();
+    let mut watch = Watch::new(&cfg.hooks, mining_since);
     let mut fail: Option<Failure> = None;
     while !stop.load(Ordering::SeqCst) {
         if last_sample.elapsed() >= Duration::from_secs(5) {
@@ -823,9 +862,22 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                             g.device,
                             cfg.temp_resume()
                         );
+                        hooks.fire(Note::gpu(
+                            Kind::GpuTooHot,
+                            g.device,
+                            format!(
+                                "{temp}C reached the {limit}C limit; paused until {}C",
+                                cfg.temp_resume()
+                            ),
+                        ));
                     } else if paused && temp <= cfg.temp_resume() {
                         g.paused.store(false, Ordering::Relaxed);
                         log!("gpu{}: cooled to {temp}C; mining again", g.device);
+                        hooks.fire(Note::gpu(
+                            Kind::GpuCooled,
+                            g.device,
+                            format!("cooled to {temp}C; mining again"),
+                        ));
                     }
                 }
                 g.set_reading(name, r);
@@ -849,6 +901,16 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
             }
             if fail.is_some() {
                 break;
+            }
+            // States that last too long: no pool, a low hashrate.
+            let now = Instant::now();
+            if let Some(n) = watch.pool_usable(ps.authorized, now) {
+                log!("{}", n.detail);
+                hooks.fire(n);
+            }
+            if let Some(n) = watch.hashrate(stats.hashrate(Duration::from_secs(60)), now) {
+                log!("{}", n.detail);
+                hooks.fire(n);
             }
             let dropped = stats.dropped.load(Ordering::Relaxed);
             if dropped > dropped_logged {
@@ -917,9 +979,15 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
         };
         match ev {
             Event::Connected {
-                url, session, tls, ..
+                pool,
+                url,
+                session,
+                tls,
             } => {
                 log!("connected to {url}{}", if tls { " (TLS)" } else { "" });
+                for n in watch.connected(pool, &url) {
+                    hooks.fire(n);
+                }
                 stats.set_pool(&url);
                 ps.session = session;
                 ps.authorized = false;
@@ -959,7 +1027,13 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                 stats.connected.store(true, Ordering::Relaxed);
                 slot.set(ps.work());
             }
-            Event::AuthFailed(why) => log!("authorization refused: {why}"),
+            Event::AuthFailed(why) => {
+                log!("authorization refused: {why}");
+                hooks.fire(Note::new(
+                    Kind::AuthRefused,
+                    format!("authorization refused: {why}"),
+                ));
+            }
             Event::Target(t) => {
                 let d = difficulty_of_target(&t);
                 if ps.target != Some(t) {
@@ -1001,15 +1075,25 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                         stats.accepted.load(Ordering::Relaxed)
                     );
                 } else {
-                    log!(
-                        "share {seq}{by} not accepted: {}",
-                        error.unwrap_or_else(|| "rejected".into())
-                    );
+                    let why = error.unwrap_or_else(|| "rejected".into());
+                    log!("share {seq}{by} not accepted: {why}");
+                    // Stale and lost shares are the pool connection's
+                    // story (pool_* events), not a refusal.
+                    if crate::stats::refusal(&why) == crate::stats::Refusal::Rejected {
+                        hooks.fire(Note::new(
+                            Kind::ShareRejected,
+                            format!("share {seq}{by} rejected: {why}"),
+                        ));
+                    }
                 }
             }
             Event::Notice(n) => log!("{n}"),
             Event::Disconnected { reason } => {
                 log!("disconnected: {}", redact(&reason));
+                hooks.fire(Note::new(
+                    Kind::PoolDisconnected,
+                    format!("disconnected: {}", redact(&reason)),
+                ));
                 stats.connected.store(false, Ordering::Relaxed);
                 ps.authorized = false;
                 ps.job = None;
@@ -1025,6 +1109,11 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
         Some(why) => log!("stopping: {why}"),
         None => log!("stopping"),
     }
+    hooks.fire(Note::new(
+        Kind::MinerStopping,
+        fail.as_ref()
+            .map_or_else(|| "stopping (on request)".into(), |f| format!("stopping: {f}")),
+    ));
     stop.store(true, Ordering::SeqCst);
     client.stop();
     slot.set(None);
@@ -1040,6 +1129,9 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
     }
     let _ = join_by(submitter, deadline);
     print_status(&stats);
+    if let Some(r) = hook_runner {
+        r.finish(cfg.hooks.timeout + Duration::from_secs(2));
+    }
     fail.map_or(Ok(()), Err)
 }
 

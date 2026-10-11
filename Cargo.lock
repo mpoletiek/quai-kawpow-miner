@@ -1016,9 +1016,12 @@ dependencies = [
  "qkm-cuda",
  "qkm-stratum",
  "ratatui",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "toml",
+ "webpki-roots",
 ]
 
 [[package]]

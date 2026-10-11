@@ -249,6 +249,28 @@ impl GpuStats {
     }
 }
 
+/// How a share the pool did not accept counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// For old work (the job or the connection changed): normal now and then.
+    Stale,
+    /// Never answered (the connection went): a pool problem, not the share's.
+    Lost,
+    /// Refused by the pool.
+    Rejected,
+}
+
+/// How a share refused with `error` (the pool's or the client's) counts.
+pub fn refusal(error: &str) -> Refusal {
+    match error {
+        "nojob" | "stale" | "stale session" | "not connected" | "not authorized yet" => {
+            Refusal::Stale
+        }
+        "no response" | "connection closed before an answer" => Refusal::Lost,
+        _ => Refusal::Rejected,
+    }
+}
+
 /// Shared counters.
 pub struct Stats {
     started: Instant,
@@ -407,12 +429,10 @@ impl Stats {
             return device;
         }
         let e = error.unwrap_or("rejected");
-        let counter = match e {
-            "nojob" | "stale" | "stale session" | "not connected" | "not authorized yet" => {
-                &self.stale
-            }
-            "no response" | "connection closed before an answer" => &self.lost,
-            _ => &self.rejected,
+        let counter = match refusal(e) {
+            Refusal::Stale => &self.stale,
+            Refusal::Lost => &self.lost,
+            Refusal::Rejected => &self.rejected,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         *lock(&self.last_reject) = Some(e.to_string());

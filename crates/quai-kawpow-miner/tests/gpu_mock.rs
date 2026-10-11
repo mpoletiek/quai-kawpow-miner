@@ -150,3 +150,85 @@ fn mock_pool_all_gpus() {
     assert_eq!(stats.rejected.load(Ordering::Relaxed), 0);
     assert_eq!(t.accepted, stats.accepted.load(Ordering::Relaxed));
 }
+
+/// Hooks from the running miner: started, connected, a dropped connection,
+/// failover when the first pool goes away, and stopping (delivered before
+/// `run` returns). Events go to a script that appends them to a file.
+#[test]
+#[ignore = "needs the GPU"]
+fn hooks_from_the_miner() {
+    use quai_kawpow_miner::hooks::{HooksConfig, parse_events};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("qkm-gpu-hooks-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("events");
+    let script = dir.join("hook.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$QKM_EVENT|$QKM_WORKER|$QKM_DETAIL\" >> {}\n",
+            out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let events = || std::fs::read_to_string(&out).unwrap_or_default();
+    let count = |name: &str| {
+        events()
+            .lines()
+            .filter(|l| l.starts_with(&format!("{name}|")))
+            .count()
+    };
+
+    let first = MockPool::start(target_for_difficulty(0.002), Some("tok"));
+    let backup = MockPool::start(target_for_difficulty(0.002), Some("tok"));
+    first.push_job(7480, true);
+    backup.push_job(7480, true);
+    let pool = |url: String| Pool {
+        url,
+        user: "0x00050723a3F8e87f704bb78014FE7791FAf344F5.hooks-test".into(),
+        pass: "auth=tok,d=0.002".into(),
+        tls: None,
+    };
+    let mut cfg = MinerConfig::new(vec![pool(first.addr()), pool(backup.addr())]);
+    cfg.hooks = HooksConfig {
+        command: Some(script.clone()),
+        events: Some(parse_events(&["all".into()]).unwrap()),
+        interval: Duration::ZERO,
+        ..HooksConfig::default()
+    };
+    let stats = Arc::new(Stats::new(&cfg.devices));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (s2, st2) = (stats.clone(), stop.clone());
+    let miner = std::thread::spawn(move || run(cfg, st2, s2));
+
+    wait_until(120, "3 accepted shares", || accepted(&stats) >= 3);
+    wait_until(10, "miner_started and pool_connected", || {
+        count("miner_started") == 1 && count("pool_connected") == 1
+    });
+    first.drop_connections();
+    wait_until(30, "a reconnect", || {
+        count("pool_disconnected") >= 1 && count("pool_connected") >= 2
+    });
+    assert_eq!(count("pool_failover"), 0, "{}", events());
+    first.stop();
+    wait_until(60, "failover to the backup", || count("pool_failover") == 1);
+    wait_until(60, "shares on the backup", || backup.tally().accepted >= 2);
+
+    stop.store(true, Ordering::SeqCst);
+    miner.join().unwrap().unwrap();
+    let all = events();
+    println!("{all}");
+    let last = all.lines().last().unwrap();
+    assert!(
+        last.starts_with("miner_stopping|hooks-test|stopping (on request)"),
+        "{all}"
+    );
+    assert!(
+        all.contains(&format!("pool_failover|hooks-test|failed over to pool 1, {}", backup.addr())),
+        "{all}"
+    );
+    assert!(!all.contains("auth=tok"), "the token leaked: {all}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
