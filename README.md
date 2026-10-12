@@ -4,10 +4,10 @@ A KawPoW GPU miner for Quai Network, written in Rust, for NVIDIA GPUs on
 Linux. No dev fee.
 
 It mines through a Quai node's KawPoW stratum (go-quai 0.55.1 or later, or
-rs-quai), checks every share on the CPU before sending it, and runs every GPU
-in a rig from one process. It can run in a terminal with a full-screen view,
-or as a systemd service that mines from boot, with alerts, a JSON API and
-Prometheus metrics.
+rs-quai, a Rust Quai node that isn't public yet), checks every share on the
+CPU before sending it, and runs every GPU in a rig from one process. It can
+run in a terminal with a full-screen view, or as a systemd service that
+mines from boot, with alerts, a JSON API and Prometheus metrics.
 
 On six RTX 3060 Ti at 200 W on Quai mainnet it delivered 186.0 MH/s of
 useful work, counting dev fees and shares the node refused: ahead of Rigel
@@ -33,7 +33,7 @@ kawpowminer lose 11% of their shares to duplicates on a Quai node
 - [How it works](#how-it-works)
 - [Benchmarks](#benchmarks)
 - [Correctness and tests](#correctness-and-tests)
-- [Roadmap](#roadmap) · [License](#license)
+- [Roadmap](#roadmap) · [Contributing](#contributing) · [License](#license)
 
 ## What you need
 
@@ -131,9 +131,9 @@ SHA ports; the flag defaults above are what the node uses. go-quai's
 stratum has no authentication: anyone who can reach the port can mine
 through your node, so keep it on your network.
 
-**rs-quai**: the same flags (`--node.stratum-enabled`, or `stratum-enabled =
-true` under `[node]` in its config.toml), and optionally an auth token that
-miners must send. The node doesn't make one; generate it:
+**rs-quai** (a Rust Quai node, not public yet): the same flags
+(`--node.stratum-enabled`, or `stratum-enabled = true` under `[node]` in its
+config.toml), and optionally an auth token that miners must send. The node doesn't make one; generate it:
 
     openssl rand -hex 16 > stratum-token
 
@@ -702,6 +702,13 @@ the example config).
   `quai_submitKawpowBlock`).
 - A HiveOS package.
 - AMD GPUs (an OpenCL or HIP backend).
+
+## Contributing
+
+Bug reports and pull requests are welcome; see
+[CONTRIBUTING.md](CONTRIBUTING.md) for building, testing (including on a
+GPU) and what a change needs. Report security problems privately, as
+[SECURITY.md](SECURITY.md) describes, not in a public issue.
 
 ## License
 

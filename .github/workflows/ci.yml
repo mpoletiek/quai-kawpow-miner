@@ -1,0 +1,27 @@
+# Formatting, lints and the CPU tests on every push to main and every pull
+# request. The GPU tests (`#[ignore]`d) need an NVIDIA GPU and run on real
+# hardware instead; see CONTRIBUTING.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # rustup installs the toolchain rust-toolchain.toml pins (with rustfmt
+      # and clippy) on the first cargo command.
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
