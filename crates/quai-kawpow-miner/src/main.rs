@@ -8,10 +8,10 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
-use quai_kawpow_miner::tune::{TuneConfig, Tuning};
 use qkm_core::kernel::{DagLoad, SearchParams, search_source};
 use qkm_core::{Epoch, Program, Verifier, boundary64, meets, period};
 use qkm_cuda::{Dag, Geometry, Gpu, Header, Kernels, Searcher, compile_cubin};
+use quai_kawpow_miner::tune::{TuneConfig, Tuning};
 
 /// Ravencoin height at 2026-10-03 (epoch 608).
 const DEFAULT_HEIGHT: u64 = 4_565_235;
@@ -69,10 +69,7 @@ struct TuneArgs {
 
 impl TuneArgs {
     fn tuning(&self) -> Tuning {
-        let pair = |v: &Option<Vec<u32>>| {
-            v.as_ref()
-                .map(|v| [v[0], *v.get(1).unwrap_or(&v[0])])
-        };
+        let pair = |v: &Option<Vec<u32>>| v.as_ref().map(|v| [v[0], *v.get(1).unwrap_or(&v[0])]);
         Tuning {
             power_limit: self.power_limit,
             lock_core_clocks: pair(&self.lock_core_clocks),
@@ -673,11 +670,18 @@ fn bench(
                     u8::from(params.lean_digest)
                 );
                 match watts {
-                    Some(w) => println!("{label}: {mhs:.2} MH/s at {w:.0} W ({:.1} kH/W)", mhs * 1e3 / w),
+                    Some(w) => println!(
+                        "{label}: {mhs:.2} MH/s at {w:.0} W ({:.1} kH/W)",
+                        mhs * 1e3 / w
+                    ),
                     None => println!("{label}: {mhs:.2} MH/s"),
                 }
                 let e = totals.entry(label.clone()).or_default();
-                *e = (e.0 + mhs, e.1 + watts.map_or(0.0, |w| mhs * 1e3 / w), e.2 + 1);
+                *e = (
+                    e.0 + mhs,
+                    e.1 + watts.map_or(0.0, |w| mhs * 1e3 / w),
+                    e.2 + 1,
+                );
                 if mhs > best.0 {
                     best = (mhs, label);
                 }
@@ -1028,7 +1032,10 @@ fn mine(
             };
             let (pool, mut n) = login(&bare, &user, &pass, auth_token_file.as_deref(), lock, tls)?;
             if url_user.is_some() && url_user != Some(user.clone()) {
-                n.push(format!("{}: the user in the URL is ignored for --user", pool.host_port()));
+                n.push(format!(
+                    "{}: the user in the URL is ignored for --user",
+                    pool.host_port()
+                ));
             }
             pool_list.push(pool);
             notes.extend(n);
@@ -1099,10 +1106,7 @@ fn mine(
         None
     };
     for n in notes {
-        quai_kawpow_miner::output::event(format!(
-            "{} {n}",
-            quai_kawpow_miner::miner::now_hms()
-        ));
+        quai_kawpow_miner::output::event(format!("{} {n}", quai_kawpow_miner::miner::now_hms()));
     }
     if let Some(addr) = api.or(file.api) {
         match quai_kawpow_miner::api::serve(addr, stats.clone()) {
@@ -1165,7 +1169,10 @@ fn read_config(path: Option<&std::path::Path>) -> Result<FileConfig, String> {
                 let line = text[..s.start.min(text.len())].matches('\n').count() + 1;
                 format!(" at line {line}")
             });
-            format!("{}: not a valid configuration{at} (details hidden when running as root)", p.display())
+            format!(
+                "{}: not a valid configuration{at} (details hidden when running as root)",
+                p.display()
+            )
         } else {
             format!("{}: {e}", p.display())
         }
@@ -1354,30 +1361,32 @@ fn run(cli: Cli) -> Result<(), CliError> {
             check,
             tls,
             tune: t,
-        } => return mine(
-            cli.device,
-            devices,
-            pools,
-            user,
-            pass,
-            auth_token_file,
-            config,
-            api,
-            status_secs,
-            no_dag_prefetch,
-            start_stagger,
-            lock,
-            temp_limit,
-            temp_resume,
-            report_hashrate,
-            no_tui,
-            log_file,
-            hook_command,
-            hook_url,
-            check,
-            tls,
-            t.tuning(),
-        ),
+        } => {
+            return mine(
+                cli.device,
+                devices,
+                pools,
+                user,
+                pass,
+                auth_token_file,
+                config,
+                api,
+                status_secs,
+                no_dag_prefetch,
+                start_stagger,
+                lock,
+                temp_limit,
+                temp_resume,
+                report_hashrate,
+                no_tui,
+                log_file,
+                hook_command,
+                hook_url,
+                check,
+                tls,
+                t.tuning(),
+            );
+        }
         Cmd::Devices => list_devices(),
         Cmd::Watch { api, config } => {
             let addr = match api {
@@ -1519,7 +1528,10 @@ mod tests {
             split_login("0xab.rig@node:3335"),
             ("node:3335".into(), Some("0xab.rig".into()), None)
         );
-        assert_eq!(split_login("stratum+tcp://node:3333"), ("stratum+tcp://node:3333".into(), None, None));
+        assert_eq!(
+            split_login("stratum+tcp://node:3333"),
+            ("stratum+tcp://node:3333".into(), None, None)
+        );
     }
 
     #[test]
@@ -1557,7 +1569,8 @@ mod tests {
                         rest.starts_with('[')
                             || rest.split_once(" = ").is_some_and(|(k, _)| {
                                 !k.is_empty()
-                                    && k.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.')
+                                    && k.chars()
+                                        .all(|c| c.is_ascii_lowercase() || c == '_' || c == '.')
                             })
                     })
                     .unwrap_or(l)
@@ -1597,7 +1610,11 @@ mod tests {
         assert_eq!(c.interval, Duration::from_secs(30));
         // The flag wins.
         let c = hooks_config(f.hooks.as_ref(), None, Some("http://10.0.0.11:9/x".into())).unwrap();
-        assert!(c.describe().contains("http://10.0.0.11/…"), "{}", c.describe());
+        assert!(
+            c.describe().contains("http://10.0.0.11/…"),
+            "{}",
+            c.describe()
+        );
         let bad = |t: &str| {
             let f: FileConfig = toml::from_str(t).unwrap();
             hooks_config(f.hooks.as_ref(), None, None).unwrap_err()
@@ -1615,9 +1632,18 @@ mod tests {
     #[test]
     fn watch_addresses() {
         assert_eq!(watch_address(None), "127.0.0.1:4073");
-        assert_eq!(watch_address(Some("10.0.0.14:4080".parse().unwrap())), "10.0.0.14:4080");
-        assert_eq!(watch_address(Some("0.0.0.0:4073".parse().unwrap())), "127.0.0.1:4073");
-        assert_eq!(watch_address(Some("[::]:4073".parse().unwrap())), "[::1]:4073");
+        assert_eq!(
+            watch_address(Some("10.0.0.14:4080".parse().unwrap())),
+            "10.0.0.14:4080"
+        );
+        assert_eq!(
+            watch_address(Some("0.0.0.0:4073".parse().unwrap())),
+            "127.0.0.1:4073"
+        );
+        assert_eq!(
+            watch_address(Some("[::]:4073".parse().unwrap())),
+            "[::1]:4073"
+        );
     }
 
     #[test]

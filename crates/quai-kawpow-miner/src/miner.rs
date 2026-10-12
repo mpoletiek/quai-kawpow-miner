@@ -272,8 +272,11 @@ fn gpu_thread(mut c: GpuCtx) {
             return;
         }
         log!("gpu{dev}: GPU error ({failures}): {e}; retrying");
-        c.hooks
-            .fire(Note::gpu(Kind::GpuError, dev, format!("error {failures}: {e}")));
+        c.hooks.fire(Note::gpu(
+            Kind::GpuError,
+            dev,
+            format!("error {failures}: {e}"),
+        ));
         if failures >= RESET_AFTER {
             // Everything on the old context was dropped with gpu_loop's
             // state (the DAG built ahead is joined on drop); only this
@@ -365,9 +368,15 @@ fn gpu_loop(c: &GpuCtx) -> Result<(), String> {
                     Ok(Ok(d)) if nd.epoch == epoch.number => ready = Some(d),
                     Ok(Ok(_)) => {}
                     Ok(Err(err)) => {
-                        log!("gpu{dev}: epoch {}: DAG built ahead failed: {err}", nd.epoch);
+                        log!(
+                            "gpu{dev}: epoch {}: DAG built ahead failed: {err}",
+                            nd.epoch
+                        );
                     }
-                    Err(_) => log!("gpu{dev}: epoch {}: the DAG prefetch thread panicked", nd.epoch),
+                    Err(_) => log!(
+                        "gpu{dev}: epoch {}: the DAG prefetch thread panicked",
+                        nd.epoch
+                    ),
                 }
             }
             // Free the old DAG before allocating the next one.
@@ -432,7 +441,10 @@ fn gpu_loop(c: &GpuCtx) -> Result<(), String> {
             let (free, _) = gpu.memory().map_err(e)?;
             let build = (free as u64 > next.dataset_bytes + (512 << 20)).then(|| {
                 let (g, v) = (gpu.clone(), c.verifier.clone());
-                log!("gpu{dev}: epoch {}: building the next DAG ahead", next.number);
+                log!(
+                    "gpu{dev}: epoch {}: building the next DAG ahead",
+                    next.number
+                );
                 std::thread::spawn(move || {
                     let ec = v.epoch_cache(next_first);
                     g.generate_dag(next, &ec.cache).map_err(|e| e.to_string())
@@ -781,11 +793,7 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
     }
     hooks.fire(Note::new(
         Kind::MinerStarted,
-        format!(
-            "started on {} of {} GPUs",
-            opened.len(),
-            cfg.devices.len()
-        ),
+        format!("started on {} of {} GPUs", opened.len(), cfg.devices.len()),
     ));
     let verifier = Arc::new(Verifier::default());
     let slot = Arc::new(Slot::default());
@@ -945,9 +953,7 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
                 }
             }
         }
-        if cfg.report_hashrate
-            && last_report.elapsed() >= Duration::from_secs(60)
-            && ps.authorized
+        if cfg.report_hashrate && last_report.elapsed() >= Duration::from_secs(60) && ps.authorized
         {
             last_report = Instant::now();
             hashrate_reporter.report_hashrate(stats.hashrate(Duration::from_secs(60)));
@@ -973,7 +979,9 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
             Ok(ev) => ev,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
-                fail = Some(Failure::transient("the stratum client stopped unexpectedly"));
+                fail = Some(Failure::transient(
+                    "the stratum client stopped unexpectedly",
+                ));
                 break;
             }
         };
@@ -1111,8 +1119,10 @@ pub fn run(cfg: MinerConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) -> Result
     }
     hooks.fire(Note::new(
         Kind::MinerStopping,
-        fail.as_ref()
-            .map_or_else(|| "stopping (on request)".into(), |f| format!("stopping: {f}")),
+        fail.as_ref().map_or_else(
+            || "stopping (on request)".into(),
+            |f| format!("stopping: {f}"),
+        ),
     ));
     stop.store(true, Ordering::SeqCst);
     client.stop();
@@ -1186,12 +1196,19 @@ pub fn apply_tuning(devices: &[usize], tune: &TuneConfig) {
             .filter_map(|&d| {
                 let want = tune.for_device(d).power_limit?;
                 let id = qkm_cuda::pci_bus_id(d).ok()?;
-                let have = nvml.device_by_pci_bus_id(id).ok()?.power_management_limit().ok()? / 1000;
+                let have = nvml
+                    .device_by_pci_bus_id(id)
+                    .ok()?
+                    .power_management_limit()
+                    .ok()?
+                    / 1000;
                 (have != want).then(|| format!("gpu{d} {have} W (want {want} W)"))
             })
             .collect();
         if off.is_empty() {
-            log!("tuning: not root; using the GPUs' current settings (power limits are as configured)");
+            log!(
+                "tuning: not root; using the GPUs' current settings (power limits are as configured)"
+            );
         } else {
             log!(
                 "tuning: not root and the GPUs are not as configured: {}; run `sudo quai-kawpow-miner tune` with the same settings",

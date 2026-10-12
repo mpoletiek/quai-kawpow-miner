@@ -136,7 +136,10 @@ fn mock_pool_all_gpus() {
     }
     let a = per_gpu(&stats);
     wait_until(120, "3 more shares from every GPU", || {
-        per_gpu(&stats).iter().zip(&a).all(|(now, was)| *now >= was + 3)
+        per_gpu(&stats)
+            .iter()
+            .zip(&a)
+            .all(|(now, was)| *now >= was + 3)
     });
 
     stop.store(true, Ordering::SeqCst);
@@ -226,7 +229,10 @@ fn hooks_from_the_miner() {
         "{all}"
     );
     assert!(
-        all.contains(&format!("pool_failover|hooks-test|failed over to pool 1, {}", backup.addr())),
+        all.contains(&format!(
+            "pool_failover|hooks-test|failed over to pool 1, {}",
+            backup.addr()
+        )),
         "{all}"
     );
     assert!(!all.contains("auth=tok"), "the token leaked: {all}");

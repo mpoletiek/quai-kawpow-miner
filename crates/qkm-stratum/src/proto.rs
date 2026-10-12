@@ -384,7 +384,9 @@ mod tests {
         // Multi-byte characters where hex belongs (once a panic).
         let bad = r#"{"id":null,"method":"mining.notify","params":["j","aé00000000000000000000000000000000000000000000000000000000000001","bb","00",true,1,"1b"]}"#;
         assert!(parse_line(bad).is_err());
-        assert!(parse_line(r#"{"id":null,"method":"mining.set_extranonce","params":["é"]}"#).is_err());
+        assert!(
+            parse_line(r#"{"id":null,"method":"mining.set_extranonce","params":["é"]}"#).is_err()
+        );
         assert_eq!(subscribe_extranonce(&json!([null, "éé"])), Vec::<u8>::new());
         assert!(unhex("zz").is_err());
         assert_eq!(unhex("0XAbC0").unwrap(), vec![0xab, 0xc0]);
@@ -396,7 +398,14 @@ mod tests {
         );
         assert!(parse_line(&far).unwrap_err().contains("hostile"));
         // Garbage of every sort.
-        for l in ["", "{", "[]", "null", r#"{"id":"x"}"#, r#"{"method":"mining.notify","params":[1,2,3,4,5,6]}"#] {
+        for l in [
+            "",
+            "{",
+            "[]",
+            "null",
+            r#"{"id":"x"}"#,
+            r#"{"method":"mining.notify","params":[1,2,3,4,5,6]}"#,
+        ] {
             let _ = parse_line(l);
         }
     }

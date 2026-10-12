@@ -192,10 +192,16 @@ pub fn apply(nvml: &Nvml, pci_bus_id: &str, t: &Tuning) -> Applied {
         );
     }
     if let Some(o) = t.core_offset {
-        note(format!("core offset {o:+} MHz"), d.set_gpc_clock_vf_offset(o));
+        note(
+            format!("core offset {o:+} MHz"),
+            d.set_gpc_clock_vf_offset(o),
+        );
     }
     if let Some(o) = t.mem_offset {
-        note(format!("memory offset {o:+} MHz"), d.set_mem_clock_vf_offset(o));
+        note(
+            format!("memory offset {o:+} MHz"),
+            d.set_mem_clock_vf_offset(o),
+        );
     }
     if let Some(f) = t.fan {
         let r = d
@@ -271,7 +277,9 @@ pub fn show(nvml: &Nvml, pci_bus_id: &str) -> String {
                 .join("/")
         },
     );
-    format!("power limit {pl} (range {range}), core offset {co} MHz, memory offset {mo} MHz, fans {fans}")
+    format!(
+        "power limit {pl} (range {range}), core offset {co} MHz, memory offset {mo} MHz, fans {fans}"
+    )
 }
 
 #[cfg(test)]

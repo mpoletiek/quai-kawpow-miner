@@ -428,7 +428,11 @@ pub fn search_source(p: &Program, dag_elements: u32, params: SearchParams) -> St
     }
     let _ = writeln!(s, "#define DAG_LOAD(p) {}", params.dag_load.expr());
     let _ = writeln!(s, "#define QKM_MAX_RESULTS {MAX_RESULTS}u");
-    let _ = writeln!(s, "#define QKM_LEAN_DIGEST {}", u8::from(params.lean_digest));
+    let _ = writeln!(
+        s,
+        "#define QKM_LEAN_DIGEST {}",
+        u8::from(params.lean_digest)
+    );
     let words: Vec<String> = RAVENCOIN_KAWPOW
         .iter()
         .map(|w| format!("0x{w:02x}u"))

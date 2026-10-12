@@ -587,7 +587,9 @@ impl Stats {
     pub fn prometheus(&self) -> String {
         use std::fmt::Write as _;
         fn esc(s: &str) -> String {
-            s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
         }
         let mut o = String::new();
         let mut metric = |name: &str, kind: &str, help: &str, rows: Vec<(String, f64)>| {
@@ -614,8 +616,14 @@ impl Stats {
             "gauge",
             "Hashrate of all GPUs.",
             vec![
-                ("window=\"1m\"".into(), self.hashrate(Duration::from_secs(60))),
-                ("window=\"10m\"".into(), self.hashrate(Duration::from_secs(600))),
+                (
+                    "window=\"1m\"".into(),
+                    self.hashrate(Duration::from_secs(60)),
+                ),
+                (
+                    "window=\"10m\"".into(),
+                    self.hashrate(Duration::from_secs(600)),
+                ),
             ],
         );
         metric(
@@ -849,7 +857,12 @@ mod tests {
         s.share_result(1, true, None, Duration::from_millis(15));
         s.share_result(2, false, Some("nojob"), Duration::ZERO);
         s.share_result(3, false, Some("no response"), Duration::ZERO);
-        s.share_result(4, false, Some("share difficulty below target"), Duration::ZERO);
+        s.share_result(
+            4,
+            false,
+            Some("share difficulty below target"),
+            Duration::ZERO,
+        );
         assert_eq!(s.accepted.load(Ordering::Relaxed), 1);
         assert_eq!(s.stale.load(Ordering::Relaxed), 1);
         assert_eq!(s.lost.load(Ordering::Relaxed), 1);

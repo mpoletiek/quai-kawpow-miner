@@ -406,7 +406,10 @@ impl Delivery {
     }
 
     fn message(&self, worker: &str) -> String {
-        let gpu = self.note.gpu.map_or_else(String::new, |g| format!("gpu{g}: "));
+        let gpu = self
+            .note
+            .gpu
+            .map_or_else(String::new, |g| format!("gpu{g}: "));
         let on = if self.gpus.len() > 1 {
             let names: Vec<String> = self.gpus.iter().map(|g| format!("gpu{g}")).collect();
             format!(", on {}", names.join(" "))
@@ -418,10 +421,7 @@ impl Delivery {
             1 => format!(" (and 1 more like it{on})"),
             n => format!(" (and {n} more like it{on})"),
         };
-        clean(
-            &format!("{worker}: {gpu}{}{more}", self.note.detail),
-            1800,
-        )
+        clean(&format!("{worker}: {gpu}{}{more}", self.note.detail), 1800)
     }
 
     fn json(&self, worker: &str) -> Vec<u8> {
@@ -652,9 +652,7 @@ fn deliver_loop(
             send(&Delivery::single(note, rate));
             continue;
         }
-        let recent = last
-            .get(&kind)
-            .is_some_and(|t| t.elapsed() < cfg.interval);
+        let recent = last.get(&kind).is_some_and(|t| t.elapsed() < cfg.interval);
         if !recent {
             last.insert(kind, Instant::now());
             send(&Delivery::single(note, rate));
@@ -885,7 +883,10 @@ impl Watch {
 
     /// Connected to `pools[pool]` at `url`.
     pub fn connected(&mut self, pool: usize, url: &str) -> Vec<Note> {
-        let mut out = vec![Note::new(Kind::PoolConnected, format!("connected to {url}"))];
+        let mut out = vec![Note::new(
+            Kind::PoolConnected,
+            format!("connected to {url}"),
+        )];
         match (self.pool, pool) {
             (Some(p), 0) if p > 0 => out.push(Note::new(
                 Kind::PoolPrimaryBack,
@@ -984,7 +985,10 @@ mod tests {
     #[test]
     fn webhook_urls() {
         let w = Webhook::parse("https://discord.com/api/webhooks/1/SECRET").unwrap();
-        assert_eq!((w.tls, w.port, w.path.as_str()), (true, 443, "/api/webhooks/1/SECRET"));
+        assert_eq!(
+            (w.tls, w.port, w.path.as_str()),
+            (true, 443, "/api/webhooks/1/SECRET")
+        );
         assert_eq!(w.authority(), "discord.com");
         assert!(!format!("{w:?}").contains("SECRET"));
         assert!(!w.shown().contains("SECRET"));
@@ -992,10 +996,20 @@ mod tests {
         assert_eq!((w.tls, w.port, w.path.as_str()), (false, 8080, "/"));
         assert_eq!(w.authority(), "10.0.0.11:8080");
         let w = Webhook::parse("http://[::1]:9/x?y=1").unwrap();
-        assert_eq!((w.host.as_str(), w.port, w.path.as_str()), ("::1", 9, "/x?y=1"));
+        assert_eq!(
+            (w.host.as_str(), w.port, w.path.as_str()),
+            ("::1", 9, "/x?y=1")
+        );
         assert_eq!(w.authority(), "[::1]:9");
         assert_eq!(Webhook::parse("http://h?a=1").unwrap().path, "/?a=1");
-        for bad in ["ftp://h/", "h/x", "http://", "http://u:p@h/", "http://h:x/", "http://h/a b"] {
+        for bad in [
+            "ftp://h/",
+            "h/x",
+            "http://",
+            "http://u:p@h/",
+            "http://h:x/",
+            "http://h/a b",
+        ] {
             assert!(Webhook::parse(bad).is_err(), "{bad}");
         }
     }
@@ -1016,7 +1030,11 @@ mod tests {
 
     #[test]
     fn payloads() {
-        let d = delivery(Kind::GpuTooHot, Some(3), "91C reached the 90C limit;\npaused");
+        let d = delivery(
+            Kind::GpuTooHot,
+            Some(3),
+            "91C reached the 90C limit;\npaused",
+        );
         let msg = d.message("octo0");
         assert_eq!(
             msg,
@@ -1071,13 +1089,25 @@ mod tests {
         let kinds = |v: Vec<Note>| v.into_iter().map(|n| n.kind).collect::<Vec<_>>();
         assert_eq!(kinds(w.connected(0, "a")), [Kind::PoolConnected]);
         assert_eq!(kinds(w.connected(0, "a")), [Kind::PoolConnected]);
-        assert_eq!(kinds(w.connected(1, "b")), [Kind::PoolConnected, Kind::PoolFailover]);
+        assert_eq!(
+            kinds(w.connected(1, "b")),
+            [Kind::PoolConnected, Kind::PoolFailover]
+        );
         assert_eq!(kinds(w.connected(1, "b")), [Kind::PoolConnected]);
-        assert_eq!(kinds(w.connected(2, "c")), [Kind::PoolConnected, Kind::PoolFailover]);
-        assert_eq!(kinds(w.connected(0, "a")), [Kind::PoolConnected, Kind::PoolPrimaryBack]);
+        assert_eq!(
+            kinds(w.connected(2, "c")),
+            [Kind::PoolConnected, Kind::PoolFailover]
+        );
+        assert_eq!(
+            kinds(w.connected(0, "a")),
+            [Kind::PoolConnected, Kind::PoolPrimaryBack]
+        );
         // Starting on a backup (the first pool never answered) is a failover.
         let mut w = Watch::new(&cfg, Instant::now());
-        assert_eq!(kinds(w.connected(1, "b")), [Kind::PoolConnected, Kind::PoolFailover]);
+        assert_eq!(
+            kinds(w.connected(1, "b")),
+            [Kind::PoolConnected, Kind::PoolFailover]
+        );
     }
 
     #[test]
@@ -1099,7 +1129,11 @@ mod tests {
         assert_eq!(w.hashrate(90e6, s(399)), None);
         let low = w.hashrate(90e6, s(400)).unwrap();
         assert_eq!(low.kind, Kind::HashrateLow);
-        assert!(low.detail.contains("90.0 MH/s, below 100.0"), "{}", low.detail);
+        assert!(
+            low.detail.contains("90.0 MH/s, below 100.0"),
+            "{}",
+            low.detail
+        );
         assert_eq!(w.hashrate(80e6, s(900)), None, "once");
         assert_eq!(w.hashrate(120e6, s(905)).unwrap().kind, Kind::HashrateOk);
         assert_eq!(w.hashrate(120e6, s(910)), None);
@@ -1115,7 +1149,8 @@ mod tests {
         let h = std::thread::spawn(move || {
             let (mut c, _) = l.accept().unwrap();
             let req = read_request(&mut c);
-            let _ = c.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n").as_bytes());
+            let _ =
+                c.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n").as_bytes());
             req
         });
         (port, h)
@@ -1151,11 +1186,25 @@ mod tests {
         let (port, h) = http_server(204);
         let w = Webhook::parse(&format!("http://127.0.0.1:{port}/hook/SECRET?x=1")).unwrap();
         let d = delivery(Kind::GpuFailed, Some(1), "given up");
-        let code = post(&w, "application/json", "t", &d.json("octo0"), Duration::from_secs(5), &tls).unwrap();
+        let code = post(
+            &w,
+            "application/json",
+            "t",
+            &d.json("octo0"),
+            Duration::from_secs(5),
+            &tls,
+        )
+        .unwrap();
         assert_eq!(code, 204);
         let req = h.join().unwrap();
-        assert!(req.starts_with("POST /hook/SECRET?x=1 HTTP/1.1\r\n"), "{req}");
-        assert!(req.contains(&format!("Host: 127.0.0.1:{port}\r\n")), "{req}");
+        assert!(
+            req.starts_with("POST /hook/SECRET?x=1 HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(
+            req.contains(&format!("Host: 127.0.0.1:{port}\r\n")),
+            "{req}"
+        );
         assert!(req.contains("Content-Type: application/json\r\n"), "{req}");
         let body = req.split("\r\n\r\n").nth(1).unwrap();
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -1163,7 +1212,10 @@ mod tests {
 
         let (port, h) = http_server(500);
         let w = Webhook::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
-        assert_eq!(post(&w, "text/plain", "t", b"hi", Duration::from_secs(5), &tls), Ok(500));
+        assert_eq!(
+            post(&w, "text/plain", "t", b"hi", Duration::from_secs(5), &tls),
+            Ok(500)
+        );
         h.join().unwrap();
     }
 
@@ -1191,9 +1243,8 @@ mod tests {
                 let conn = rustls::ServerConnection::new(server.clone()).unwrap();
                 let mut s = rustls::StreamOwned::new(conn, c);
                 let _ = s.sock.set_read_timeout(Some(Duration::from_secs(5)));
-                let req = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    read_request(&mut s)
-                }));
+                let req =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_request(&mut s)));
                 if let Ok(req) = req {
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
                     let _ = s.flush();
@@ -1205,13 +1256,32 @@ mod tests {
         let w = Webhook::parse(&format!("https://localhost:{port}/x")).unwrap();
         // Mozilla's roots: the self-signed certificate is refused.
         let public = tls_config(webpki_roots()).unwrap();
-        let e = post(&w, "text/plain", "t", b"no", Duration::from_secs(5), &public).unwrap_err();
-        assert!(e.contains("certificate") || e.contains("UnknownIssuer"), "{e}");
+        let e = post(
+            &w,
+            "text/plain",
+            "t",
+            b"no",
+            Duration::from_secs(5),
+            &public,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("certificate") || e.contains("UnknownIssuer"),
+            "{e}"
+        );
         // Trusting it: delivered.
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert).unwrap();
         let own = tls_config(roots).unwrap();
-        let code = post(&w, "text/plain", "t", b"hello", Duration::from_secs(5), &own).unwrap();
+        let code = post(
+            &w,
+            "text/plain",
+            "t",
+            b"hello",
+            Duration::from_secs(5),
+            &own,
+        )
+        .unwrap();
         assert_eq!(code, 200);
         let got = h.join().unwrap();
         assert!(got.iter().any(|r| r.ends_with("\r\n\r\nhello")), "{got:?}");
@@ -1225,7 +1295,15 @@ mod tests {
         let tls = tls_config(webpki_roots()).unwrap();
         let w = Webhook::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let t = Instant::now();
-        let e = post(&w, "text/plain", "t", b"x", Duration::from_millis(500), &tls).unwrap_err();
+        let e = post(
+            &w,
+            "text/plain",
+            "t",
+            b"x",
+            Duration::from_millis(500),
+            &tls,
+        )
+        .unwrap_err();
         assert!(t.elapsed() < Duration::from_secs(3), "{e}");
         drop(l);
     }
@@ -1264,7 +1342,10 @@ mod tests {
         let slow = script(&dir, "slow.sh", "sleep 30");
         let t = Instant::now();
         let e = run_command(&slow, &d, "w", Duration::from_millis(300)).unwrap_err();
-        assert!(e.contains("killed") && t.elapsed() < Duration::from_secs(3), "{e}");
+        assert!(
+            e.contains("killed") && t.elapsed() < Duration::from_secs(3),
+            "{e}"
+        );
         let e = run_command(&dir.join("missing"), &d, "w", Duration::from_secs(1)).unwrap_err();
         assert!(e.contains("cannot run"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();

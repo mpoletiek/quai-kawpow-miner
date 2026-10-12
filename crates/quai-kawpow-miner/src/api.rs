@@ -116,7 +116,10 @@ pub fn fetch_screen(addr: &str, timeout: Duration) -> Result<Screen, String> {
         .ok_or_else(|| format!("{addr}: not an HTTP answer"))?;
     let status = String::from_utf8_lossy(&raw[..split]);
     if !status.lines().next().is_some_and(|l| l.contains(" 200")) {
-        return Err(format!("{addr}: {}", status.lines().next().unwrap_or("no status")));
+        return Err(format!(
+            "{addr}: {}",
+            status.lines().next().unwrap_or("no status")
+        ));
     }
     serde_json::from_slice(&raw[split + 4..]).map_err(|e| {
         format!("{addr}: not a quai-kawpow-miner API with /view (an older miner?): {e}")

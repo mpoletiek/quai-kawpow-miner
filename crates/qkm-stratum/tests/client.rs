@@ -261,7 +261,9 @@ fn every_pool_refusing_is_fatal() {
     let (tx, rx) = channel();
     let c = Client::start(quick(vec![other_zone, bad_lock]), tx);
     let seen = wait_for(&rx, 20, |e| matches!(e, Event::Fatal(_)));
-    let Some(Event::Fatal(why)) = seen.last() else { panic!() };
+    let Some(Event::Fatal(why)) = seen.last() else {
+        panic!()
+    };
     assert!(why.contains("not internal to this zone"), "{why}");
     assert!(why.contains("invalid lock value"), "{why}");
     c.stop();
@@ -282,9 +284,11 @@ fn an_unanswered_authorize_reconnects() {
     let mut cfg = quick(vec![pool(&addr, "")]);
     cfg.response_timeout = Duration::from_millis(500);
     let c = Client::start(cfg, tx);
-    wait_for(&rx, 10, |e| {
-        matches!(e, Event::Disconnected { reason } if reason.contains("no answer to mining.subscribe"))
-    });
+    wait_for(
+        &rx,
+        10,
+        |e| matches!(e, Event::Disconnected { reason } if reason.contains("no answer to mining.subscribe")),
+    );
     c.stop();
 }
 
@@ -306,9 +310,11 @@ fn an_endless_line_ends_the_connection() {
     });
     let (tx, rx) = channel();
     let c = Client::start(quick(vec![pool(&addr, "")]), tx);
-    wait_for(&rx, 10, |e| {
-        matches!(e, Event::Disconnected { reason } if reason.contains("longer than 64 KiB"))
-    });
+    wait_for(
+        &rx,
+        10,
+        |e| matches!(e, Event::Disconnected { reason } if reason.contains("longer than 64 KiB")),
+    );
     c.stop();
 }
 
@@ -321,7 +327,10 @@ fn goes_back_to_the_first_pool_once_it_answers() {
     let backup = MockPool::start(easy_target(), None);
     backup.push_job(100, true);
     let (tx, rx) = channel();
-    let mut cfg = quick(vec![pool(&first_addr.to_string(), ""), pool(&backup.addr(), "")]);
+    let mut cfg = quick(vec![
+        pool(&first_addr.to_string(), ""),
+        pool(&backup.addr(), ""),
+    ]);
     cfg.primary_retry = Duration::from_secs(1);
     cfg.probe_every = Duration::from_millis(500);
     let c = Client::start(cfg, tx);

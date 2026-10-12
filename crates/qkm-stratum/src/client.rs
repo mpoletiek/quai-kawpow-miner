@@ -183,9 +183,16 @@ enum Cmd {
 }
 
 enum Pending {
-    Subscribe { sent: Instant },
-    Authorize { sent: Instant },
-    Submit { seq: u64, sent: Instant },
+    Subscribe {
+        sent: Instant,
+    },
+    Authorize {
+        sent: Instant,
+    },
+    Submit {
+        seq: u64,
+        sent: Instant,
+    },
     /// A request whose answer does not matter (`eth_submitHashrate`).
     Other,
 }
@@ -386,7 +393,10 @@ fn read_lines(read_half: impl Read, session_id: u64, tx: &Sender<Cmd>) {
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match (&mut r).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf) {
+        match (&mut r)
+            .take(MAX_LINE as u64 + 1)
+            .read_until(b'\n', &mut buf)
+        {
             Ok(0) => {
                 let _ = tx.send(Cmd::Closed(session_id, "closed by the pool".into()));
                 return;

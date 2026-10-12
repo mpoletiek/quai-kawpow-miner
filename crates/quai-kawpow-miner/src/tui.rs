@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -30,7 +31,6 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Sparkline, Table};
-use ratatui::Frame;
 
 use crate::api::fetch_screen;
 use crate::stats::{GpuState, GpuView, Stats, View};
@@ -51,7 +51,10 @@ fn restore_stderr() {
 
 fn redirect_stderr(to: Option<&Path>) {
     let f = match to {
-        Some(p) => std::fs::OpenOptions::new().create(true).append(true).open(p),
+        Some(p) => std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p),
         None => File::options().write(true).open("/dev/null"),
     };
     let Ok(f) = f else { return };
@@ -217,7 +220,10 @@ fn ui_loop(mut term: Terminal<CrosstermBackend<Stdout>>, feed: &Feed, stop: &Ato
                 refresh(feed, &mut ui, &mut screen);
                 last_read = Instant::now();
             }
-            if ui.quit_armed.is_some_and(|t| t.elapsed() > Duration::from_secs(3)) {
+            if ui
+                .quit_armed
+                .is_some_and(|t| t.elapsed() > Duration::from_secs(3))
+            {
                 ui.quit_armed = None;
             }
             let _ = term.draw(|f| draw(f, &screen.0, &screen.1, &ui));
@@ -282,7 +288,13 @@ fn age(d: Duration) -> String {
 fn uptime(d: Duration) -> String {
     let s = d.as_secs();
     if s >= 86400 {
-        format!("{}d {:02}:{:02}:{:02}", s / 86400, s / 3600 % 24, s / 60 % 60, s % 60)
+        format!(
+            "{}d {:02}:{:02}:{:02}",
+            s / 86400,
+            s / 3600 % 24,
+            s / 60 % 60,
+            s % 60
+        )
     } else {
         format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
     }
@@ -299,7 +311,11 @@ fn short_worker(w: &str) -> String {
     } else {
         addr.to_string()
     };
-    if name.is_empty() { addr } else { format!("{addr}.{name}") }
+    if name.is_empty() {
+        addr
+    } else {
+        format!("{addr}.{name}")
+    }
 }
 
 /// `NVIDIA GeForce RTX 3060 Ti` → `RTX 3060 Ti`.
@@ -374,7 +390,9 @@ fn draw_header(f: &mut Frame, area: Rect, v: &View) {
     let who = if wide {
         short_worker(&v.worker)
     } else {
-        v.worker.split_once('.').map_or_else(|| short_worker(&v.worker), |(_, w)| w.to_string())
+        v.worker
+            .split_once('.')
+            .map_or_else(|| short_worker(&v.worker), |(_, w)| w.to_string())
     };
     spans.extend([Span::raw(sep), Span::raw(who).bold()]);
     if !v.payout.is_empty() {
@@ -382,7 +400,11 @@ fn draw_header(f: &mut Frame, area: Rect, v: &View) {
     }
     spans.extend([
         Span::raw(sep),
-        Span::raw(format!("{dot} ")).fg(if v.connected { Color::Green } else { Color::Red }),
+        Span::raw(format!("{dot} ")).fg(if v.connected {
+            Color::Green
+        } else {
+            Color::Red
+        }),
         pool,
         Span::raw(sep),
         Span::raw("up "),
@@ -412,8 +434,7 @@ fn draw_summary(f: &mut Frame, area: Rect, v: &View) {
         .title(" Hashrate ".bold());
     let inner = block.inner(left);
     f.render_widget(block, left);
-    let [num, spark] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    let [num, spark] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
     let w = spark.width as usize;
     let recent = &v.history[v.history.len().saturating_sub(w)..];
     let lo = recent.iter().copied().fold(f64::INFINITY, f64::min);
@@ -423,7 +444,10 @@ fn draw_summary(f: &mut Frame, area: Rect, v: &View) {
         Span::styled(format!("  10 min {}", mhs(v.rate_10m)), dim()),
     ];
     if !recent.is_empty() && inner.width >= 52 {
-        top.push(Span::styled(format!("  range {}–{}", mhs(lo), mhs(hi)), dim()));
+        top.push(Span::styled(
+            format!("  range {}–{}", mhs(lo), mhs(hi)),
+            dim(),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(top)), num);
     // Scaled to the recent range (a steady rig is not a solid wall), with
@@ -465,7 +489,11 @@ fn draw_summary(f: &mut Frame, area: Rect, v: &View) {
         Span::raw(v.last_accept.map_or_else(|| "-".into(), age)),
     ];
     if v.gpu_errors > 0 {
-        shares.push(Span::raw(format!("   GPU ERRORS {}", v.gpu_errors)).red().bold());
+        shares.push(
+            Span::raw(format!("   GPU ERRORS {}", v.gpu_errors))
+                .red()
+                .bold(),
+        );
     }
     let job = match &v.job {
         Some((_, h)) => format!("h{h}  epoch {}", h / 7500),
@@ -480,7 +508,10 @@ fn draw_summary(f: &mut Frame, area: Rect, v: &View) {
         ]),
         Line::from(vec![
             Span::raw("Latency "),
-            Span::raw(v.avg_latency_ms.map_or_else(|| "-".into(), |l| format!("{l} ms"))),
+            Span::raw(
+                v.avg_latency_ms
+                    .map_or_else(|| "-".into(), |l| format!("{l} ms")),
+            ),
             Span::raw("   Power "),
             Span::raw(total_power(v).map_or_else(|| "-".into(), |p| format!("{p:.0} W"))),
             Span::raw("   "),
@@ -509,25 +540,101 @@ struct Col {
 }
 
 const COLS: &[Col] = &[
-    Col { name: "GPU", width: 3, prio: 0 },
-    Col { name: "Name", width: 12, prio: 8 },
-    Col { name: "Bus", width: 7, prio: 9 },
-    Col { name: "State", width: 8, prio: 1 },
-    Col { name: "MH/s", width: 7, prio: 0 },
-    Col { name: "10 min", width: 7, prio: 5 },
-    Col { name: "A/R", width: 7, prio: 1 },
-    Col { name: "Last", width: 6, prio: 4 },
-    Col { name: "Temp", width: 4, prio: 0 },
-    Col { name: "Fan", width: 4, prio: 2 },
-    Col { name: "Power", width: 9, prio: 0 },
-    Col { name: "kH/W", width: 5, prio: 3 },
-    Col { name: "Core", width: 5, prio: 3 },
-    Col { name: "Mem", width: 5, prio: 4 },
-    Col { name: "Util", width: 4, prio: 6 },
-    Col { name: "VRAM", width: 9, prio: 7 },
-    Col { name: "P", width: 3, prio: 7 },
-    Col { name: "PCIe", width: 5, prio: 9 },
-    Col { name: "Throttle", width: 14, prio: 5 },
+    Col {
+        name: "GPU",
+        width: 3,
+        prio: 0,
+    },
+    Col {
+        name: "Name",
+        width: 12,
+        prio: 8,
+    },
+    Col {
+        name: "Bus",
+        width: 7,
+        prio: 9,
+    },
+    Col {
+        name: "State",
+        width: 8,
+        prio: 1,
+    },
+    Col {
+        name: "MH/s",
+        width: 7,
+        prio: 0,
+    },
+    Col {
+        name: "10 min",
+        width: 7,
+        prio: 5,
+    },
+    Col {
+        name: "A/R",
+        width: 7,
+        prio: 1,
+    },
+    Col {
+        name: "Last",
+        width: 6,
+        prio: 4,
+    },
+    Col {
+        name: "Temp",
+        width: 4,
+        prio: 0,
+    },
+    Col {
+        name: "Fan",
+        width: 4,
+        prio: 2,
+    },
+    Col {
+        name: "Power",
+        width: 9,
+        prio: 0,
+    },
+    Col {
+        name: "kH/W",
+        width: 5,
+        prio: 3,
+    },
+    Col {
+        name: "Core",
+        width: 5,
+        prio: 3,
+    },
+    Col {
+        name: "Mem",
+        width: 5,
+        prio: 4,
+    },
+    Col {
+        name: "Util",
+        width: 4,
+        prio: 6,
+    },
+    Col {
+        name: "VRAM",
+        width: 9,
+        prio: 7,
+    },
+    Col {
+        name: "P",
+        width: 3,
+        prio: 7,
+    },
+    Col {
+        name: "PCIe",
+        width: 5,
+        prio: 9,
+    },
+    Col {
+        name: "Throttle",
+        width: 14,
+        prio: 5,
+    },
 ];
 
 /// The columns that fit in `width`, in table order.
@@ -554,8 +661,9 @@ fn gpu_cells(g: &GpuView, connected: bool) -> Vec<Cell<'static>> {
         .map(|c| match c.name {
             "GPU" => Cell::from(g.device.to_string()).bold(),
             "Name" => Cell::from(short_name(&g.name).to_string()),
-            "Bus" => Cell::from(g.bus.split_once(':').map_or(&*g.bus, |b| b.1).to_string())
-                .style(dim()),
+            "Bus" => {
+                Cell::from(g.bus.split_once(':').map_or(&*g.bus, |b| b.1).to_string()).style(dim())
+            }
             "State" => state_cell(g, connected),
             "MH/s" => Cell::from(mhs(g.rate_1m)).bold().cyan(),
             "10 min" => Cell::from(mhs(g.rate_10m)),
@@ -586,24 +694,32 @@ fn gpu_cells(g: &GpuView, connected: bool) -> Vec<Cell<'static>> {
                 .power_w
                 .filter(|p| *p > 1.0)
                 .map_or_else(na, |p| Cell::from(format!("{:.0}", g.rate_1m / 1e3 / p))),
-            "Core" => r.sm_clock_mhz.map_or_else(na, |m| Cell::from(m.to_string())),
-            "Mem" => r.mem_clock_mhz.map_or_else(na, |m| Cell::from(m.to_string())),
+            "Core" => r
+                .sm_clock_mhz
+                .map_or_else(na, |m| Cell::from(m.to_string())),
+            "Mem" => r
+                .mem_clock_mhz
+                .map_or_else(na, |m| Cell::from(m.to_string())),
             "Util" => r.util_pct.map_or_else(na, |u| Cell::from(format!("{u}%"))),
             "VRAM" => r.vram.map_or_else(na, |(u, t)| {
                 let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
                 Cell::from(format!("{:.1}/{:.1}G", gib(u), gib(t)))
             }),
             "P" => r.pstate.map_or_else(na, |p| Cell::from(format!("P{p}"))),
-            "PCIe" => r
-                .pcie
-                .map_or_else(na, |(gen_, w)| Cell::from(format!("{gen_}x{w}")).style(dim())),
+            "PCIe" => r.pcie.map_or_else(na, |(gen_, w)| {
+                Cell::from(format!("{gen_}x{w}")).style(dim())
+            }),
             "Throttle" => {
                 if r.throttle.is_empty() {
                     Cell::from("")
                 } else {
                     let serious = r.throttle.iter().any(|t| t != "power cap");
                     let c = Cell::from(r.throttle.join(", "));
-                    if serious { c.red().bold() } else { c.style(dim()) }
+                    if serious {
+                        c.red().bold()
+                    } else {
+                        c.style(dim())
+                    }
                 }
             }
             _ => na(),
@@ -612,7 +728,11 @@ fn gpu_cells(g: &GpuView, connected: bool) -> Vec<Cell<'static>> {
 }
 
 fn total_cells(v: &View) -> Vec<Cell<'static>> {
-    let mining = v.gpus.iter().filter(|g| g.state == GpuState::Mining).count();
+    let mining = v
+        .gpus
+        .iter()
+        .filter(|g| g.state == GpuState::Mining)
+        .count();
     let power = total_power(v);
     let acc: u64 = v.gpus.iter().map(|g| g.accepted).sum();
     let refused: u64 = v.gpus.iter().map(|g| g.refused).sum();
@@ -641,13 +761,33 @@ fn draw_gpus(f: &mut Frame, area: Rect, v: &View) {
     let keep = columns(area.width.saturating_sub(2));
     let pick = |cells: Vec<Cell<'static>>| -> Row<'static> {
         let mut cells: Vec<Option<Cell>> = cells.into_iter().map(Some).collect();
-        Row::new(keep.iter().map(|&i| cells[i].take().unwrap_or_default()).collect::<Vec<_>>())
+        Row::new(
+            keep.iter()
+                .map(|&i| cells[i].take().unwrap_or_default())
+                .collect::<Vec<_>>(),
+        )
     };
-    let header = Row::new(keep.iter().map(|&i| Cell::from(COLS[i].name)).collect::<Vec<_>>())
-        .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD | Modifier::UNDERLINED));
-    let mut rows: Vec<Row> = v.gpus.iter().map(|g| pick(gpu_cells(g, v.connected))).collect();
+    let header = Row::new(
+        keep.iter()
+            .map(|&i| Cell::from(COLS[i].name))
+            .collect::<Vec<_>>(),
+    )
+    .style(
+        Style::new()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    );
+    let mut rows: Vec<Row> = v
+        .gpus
+        .iter()
+        .map(|g| pick(gpu_cells(g, v.connected)))
+        .collect();
     if v.gpus.len() > 1 {
-        rows.push(pick(total_cells(v)).style(Style::new().add_modifier(Modifier::BOLD)).top_margin(0));
+        rows.push(
+            pick(total_cells(v))
+                .style(Style::new().add_modifier(Modifier::BOLD))
+                .top_margin(0),
+        );
     }
     let widths: Vec<Constraint> = keep
         .iter()
@@ -660,13 +800,19 @@ fn draw_gpus(f: &mut Frame, area: Rect, v: &View) {
         })
         .collect();
     f.render_widget(
-        Table::new(rows, widths).header(header).block(block).column_spacing(1),
+        Table::new(rows, widths)
+            .header(header)
+            .block(block)
+            .column_spacing(1),
         area,
     );
 }
 
 fn log_style(l: &str) -> Style {
-    if l.contains("not accepted") || l.contains("BUG") || l.contains("FAILED") || l.contains("error")
+    if l.contains("not accepted")
+        || l.contains("BUG")
+        || l.contains("FAILED")
+        || l.contains("error")
     {
         Style::new().fg(Color::Red)
     } else if l.contains("disconnected") || l.contains("refused") || l.contains("retrying") {
@@ -707,10 +853,16 @@ fn draw_log(f: &mut Frame, area: Rect, log: &[String], scroll: usize) {
 
 fn draw_footer(f: &mut Frame, area: Rect, ui: &UiState) {
     let line = if let Some(e) = &ui.unreachable {
-        let since = ui
-            .updated
-            .map_or_else(|| "never".to_string(), |t| format!("{} ago", age(t.elapsed())));
-        Line::from(format!(" {e}; retrying (last update {since}) ").bold().white().on_red())
+        let since = ui.updated.map_or_else(
+            || "never".to_string(),
+            |t| format!("{} ago", age(t.elapsed())),
+        );
+        Line::from(
+            format!(" {e}; retrying (last update {since}) ")
+                .bold()
+                .white()
+                .on_red(),
+        )
     } else if let Some(addr) = &ui.watching {
         Line::from(vec![
             Span::raw(format!(" watching {addr}   ")),
@@ -723,7 +875,12 @@ fn draw_footer(f: &mut Frame, area: Rect, ui: &UiState) {
         ])
         .style(dim())
     } else if ui.quit_armed.is_some() {
-        Line::from(" Press q again to stop the miner (Esc cancels) ".bold().black().on_yellow())
+        Line::from(
+            " Press q again to stop the miner (Esc cancels) "
+                .bold()
+                .black()
+                .on_yellow(),
+        )
     } else {
         Line::from(vec![
             Span::raw(" q").bold(),
@@ -802,7 +959,11 @@ mod tests {
         t.draw(|f| draw(f, v, &log, ui)).unwrap();
         let buf = t.backend().buffer().clone();
         (0..h)
-            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -814,10 +975,21 @@ mod tests {
             println!("{s}\n\n{}", render(&view(7), 80, 24));
         }
         for want in [
-            "145.60 MH/s", "A 34", "h4572712", "epoch 609", "0x00b9A4…135f.octo0",
+            "145.60 MH/s",
+            "A 34",
+            "h4572712",
+            "epoch 609",
+            "0x00b9A4…135f.octo0",
             "Qi · cyprus1 · lock 2",
-            "RTX 3060 Ti", "150/150W", "9251", "P2", "power cap", "all", "1049 W",
-            "share 34 from gpu3", "Log",
+            "RTX 3060 Ti",
+            "150/150W",
+            "9251",
+            "P2",
+            "power cap",
+            "all",
+            "1049 W",
+            "share 34 from gpu3",
+            "Log",
         ] {
             assert!(s.contains(want), "missing {want:?} in\n{s}");
         }
@@ -829,7 +1001,10 @@ mod tests {
         for want in ["MH/s", "Temp", "Power", "20.80", "150/150W"] {
             assert!(s.contains(want), "missing {want:?} in\n{s}");
         }
-        assert!(!s.contains("PCIe"), "a low-priority column on 80 columns:\n{s}");
+        assert!(
+            !s.contains("PCIe"),
+            "a low-priority column on 80 columns:\n{s}"
+        );
     }
 
     #[test]
@@ -839,11 +1014,17 @@ mod tests {
             ..UiState::default()
         };
         let s = render_with(&view(2), 160, 30, &ui);
-        assert!(s.contains("watching 10.0.0.14:4073") && s.contains("the miner keeps running"), "{s}");
+        assert!(
+            s.contains("watching 10.0.0.14:4073") && s.contains("the miner keeps running"),
+            "{s}"
+        );
         ui.unreachable = Some("10.0.0.14:4073: Connection refused".into());
         ui.updated = Some(Instant::now() - Duration::from_secs(75));
         let s = render_with(&view(2), 160, 30, &ui);
-        assert!(s.contains("Connection refused; retrying (last update 1m15s ago)"), "{s}");
+        assert!(
+            s.contains("Connection refused; retrying (last update 1m15s ago)"),
+            "{s}"
+        );
         // The last screen read stays up meanwhile.
         assert!(s.contains("145.60 MH/s"), "{s}");
     }

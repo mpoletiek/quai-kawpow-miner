@@ -139,7 +139,15 @@ pub struct PasswordNotes {
     pub difficulty: Option<f64>,
 }
 
-const KNOWN: [&str; 7] = ["d", "frequency", "freq", "skip", "lock", "parentupdate", "auth"];
+const KNOWN: [&str; 7] = [
+    "d",
+    "frequency",
+    "freq",
+    "skip",
+    "lock",
+    "parentupdate",
+    "auth",
+];
 
 /// Builds the stratum password: `auth=<token>` first (when a token is
 /// given), then the options in `pass`, then `lock=<lock>` (when given).
@@ -280,7 +288,11 @@ mod tests {
         let (_, n) = compose_password("d=0.01", None, None).unwrap();
         assert_eq!(n.warnings.len(), 1);
         // The '.' separator old Quai docs showed.
-        assert!(compose_password("d=1.lock=2", None, None).unwrap_err().contains("','"));
+        assert!(
+            compose_password("d=1.lock=2", None, None)
+                .unwrap_err()
+                .contains("','")
+        );
         let (_, n) = compose_password("d=1,colour=red", None, None).unwrap();
         assert_eq!(n.warnings.len(), 1);
     }
