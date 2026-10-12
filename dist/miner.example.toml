@@ -1,4 +1,9 @@
 # quai-kawpow-miner configuration (flags on the command line win).
+#
+# To get started, change only the [[pool]] section at the bottom: the node's
+# address (url), your payout address and a worker name (user), and the share
+# difficulty (pass: d = your hashrate in MH/s / 150). Then check the file:
+#   quai-kawpow-miner mine --check --config miner.toml
 
 # GPUs to mine on (CUDA indexes, see `quai-kawpow-miner devices`); default: all.
 #devices = [0, 1, 2]
