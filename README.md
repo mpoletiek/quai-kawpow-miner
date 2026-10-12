@@ -9,6 +9,12 @@ in a rig from one process. It can run in a terminal with a full-screen view,
 or as a systemd service that mines from boot, with alerts, a JSON API and
 Prometheus metrics.
 
+On six RTX 3060 Ti at 200 W on Quai mainnet it delivered 186.0 MH/s of
+useful work, counting dev fees and shares the node refused: ahead of Rigel
+(185.1), SRBMiner (180.2), T-Rex (168) and kawpowminer (166); T-Rex and
+kawpowminer lose 11% of their shares to duplicates on a Quai node
+([Benchmarks](#benchmarks)).
+
 **Contents**
 
 - [What you need](#what-you-need)
@@ -60,14 +66,14 @@ other versions and distributions differ; what matters is the driver and
 
 After the reboot, `nvidia-smi` lists your GPUs.
 
-**2. Get the miner.** Download `quai-kawpow-miner-0.1.0-linux-x86_64.tar.gz`
+**2. Get the miner.** Download `quai-kawpow-miner-0.1.1-linux-x86_64.tar.gz`
 and `SHA256SUMS` from the
 [releases page](https://github.com/mpoletiek/quai-kawpow-miner/releases),
 then:
 
     sha256sum -c SHA256SUMS
-    tar -xzf quai-kawpow-miner-0.1.0-linux-x86_64.tar.gz
-    cd quai-kawpow-miner-0.1.0-linux-x86_64
+    tar -xzf quai-kawpow-miner-0.1.1-linux-x86_64.tar.gz
+    cd quai-kawpow-miner-0.1.1-linux-x86_64
     ./quai-kawpow-miner devices          # the GPUs it sees
 
 (Or [build it from source](#building-from-source).)
