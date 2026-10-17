@@ -66,14 +66,14 @@ other versions and distributions differ; what matters is the driver and
 
 After the reboot, `nvidia-smi` lists your GPUs.
 
-**2. Get the miner.** Download `quai-kawpow-miner-0.1.1-linux-x86_64.tar.gz`
+**2. Get the miner.** Download `quai-kawpow-miner-0.1.2-linux-x86_64.tar.gz`
 and `SHA256SUMS` from the
 [releases page](https://github.com/mpoletiek/quai-kawpow-miner/releases),
 then:
 
     sha256sum -c SHA256SUMS
-    tar -xzf quai-kawpow-miner-0.1.1-linux-x86_64.tar.gz
-    cd quai-kawpow-miner-0.1.1-linux-x86_64
+    tar -xzf quai-kawpow-miner-0.1.2-linux-x86_64.tar.gz
+    cd quai-kawpow-miner-0.1.2-linux-x86_64
     ./quai-kawpow-miner devices          # the GPUs it sees
 
 (Or [build it from source](#building-from-source).)

@@ -970,14 +970,14 @@ dependencies = [
 
 [[package]]
 name = "qkm-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "qkm-kawpow",
 ]
 
 [[package]]
 name = "qkm-cuda"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cudarc",
  "qkm-core",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "qkm-kawpow"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde_json",
  "sha3",
@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "qkm-stratum"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "qkm-core",
  "rcgen",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "quai-kawpow-miner"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "ctrlc",
