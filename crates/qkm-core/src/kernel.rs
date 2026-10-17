@@ -26,6 +26,26 @@
 //!   plain loads;
 //! - memory clocks locked at 9501 MHz (P2 keeps 9251; 6% slower at 225 W)
 //!   or +500 MHz offset (9501 MHz, no faster: the memory takes the power).
+//!
+//! What holds it there (2026-10-17, octominer1 GPU 1): the L2 and memory
+//! controller (Nsight's LTS and FBPA, one clock) set the DAG bandwidth, and
+//! that clock follows the core voltage, not the core clock. At a locked
+//! 1605 MHz core, a +200 MHz curve offset dropped LTS from 1514 to
+//! 1335 MHz and DRAM throughput from 83% to 74%, in proportion; a 1200 MHz
+//! core at stock voltage gave the same 1320 MHz and the same speed. Below
+//! about 1800 MHz LTS, bandwidth is close to proportional to it; above, the
+//! DRAM itself binds. The core's own clock costs little (about 5 W from
+//! 1200 to 1605 MHz at one voltage), so at a power cap every setting lands
+//! near 162 kH/W:
+//! - core and memory offsets (`nvmlDeviceSetClockOffsets`, P2; they take
+//!   effect) at 200 W: 31.9-32.4 MH/s against 32.4 stock; fans at 100%
+//!   1.8% slower;
+//! - 4 blocks (32 warps) a SM with `__launch_bounds__(256, 4)`: the driver
+//!   raises the carveout to 100 KiB, 64 registers, no faster (the limit is
+//!   LTS throughput, not latency); 5 blocks spill at 48 registers, 6%
+//!   slower;
+//! - `ld.global.nc.L2::256B` (with or without `L1::no_allocate`): 25% more
+//!   L2 requests and sectors for the same DRAM sectors, 0.2-0.5% slower.
 
 use std::fmt::Write;
 
